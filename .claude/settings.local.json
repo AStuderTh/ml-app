@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 tennis.db \".tables\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import pandas, numpy, openpyxl; print\\('pandas', pandas.__version__\\); print\\('numpy', numpy.__version__\\); print\\('openpyxl', openpyxl.__version__\\)\")",
+      "Bash(python3 -c \"import rapidfuzz; print\\('rapidfuzz', rapidfuzz.__version__\\)\")",
+      "Bash(mkdir -p \"c:\\\\Users\\\\Adrien\\\\Documents\\\\GitHub\\\\ml-app\\\\scripts\\\\consolidate\" && ls \"c:\\\\Users\\\\Adrien\\\\Documents\\\\GitHub\\\\ml-app\\\\scripts\")",
+      "Bash(powershell -Command \"Get-Process python -ErrorAction SilentlyContinue | Select-Object Id,StartTime,CPU\")",
+      "Bash(python3 -u -c ' *)",
+      "Skill(fewer-permission-prompts)",
+      "Skill(fewer-permission-prompts:*)",
+      "Bash(ls \"C:/Users/Adrien/.claude/projects/\" 2>&1 | head -30)",
+      "Read(//c/Users/Adrien/.claude/projects/**)",
+      "Bash(python3 -m streamlit run app/streamlit_app.py --server.headless true --server.port 8501)",
+      "Bash(echo \"started pid $!\")",
+      "Bash(curl -s -o /tmp/streamlit_home.html -w \"HTTP %{http_code}\\\\n\" http://localhost:8501)",
+      "Read(//tmp/**)",
+      "Bash(pkill -f \"streamlit run\")",
+      "Bash(python3 -c \"import sys; print\\(sys.executable\\)\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\Adrien\\Documents\\GitHub\\ml-app\\scripts"
+    ]
+  }
+}
