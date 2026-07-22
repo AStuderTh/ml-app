@@ -17,6 +17,7 @@ from app.data_management import render_data_management
 from app.features import FEATURE_POOL, build_training_frame, compute_chronological_features
 from app.modeling import ALGOS
 from app.train import train_and_evaluate
+from app.upcoming import render_upcoming
 
 st.set_page_config(page_title="Tennis ML Lab", layout="wide")
 
@@ -249,6 +250,8 @@ except Exception as e:
     st.error(f"Impossible de charger data/tennis.db ({e}).")
     st.divider()
     render_data_management()
+    st.divider()
+    render_upcoming()
     st.stop()
 
 min_possible = dataset["tourney_date"].min().date()
@@ -285,8 +288,8 @@ st.caption(f"{len(full_frame)} matchs avec cotes sur la période/surfaces sélec
            f"— Train: {len(train_frame)} · Test: {len(test_frame)}")
 st.divider()
 
-tab_brute, tab_manual, tab_saved, tab_data = st.tabs(
-    ["🎲 Bruteforce", "🛠️ Construire un modèle", "💾 Modèles sauvegardés", "🗄️ Données"]
+tab_brute, tab_manual, tab_saved, tab_upcoming, tab_data = st.tabs(
+    ["🎲 Bruteforce", "🛠️ Construire un modèle", "💾 Modèles sauvegardés", "📅 Prochains matchs", "🗄️ Données"]
 )
 
 # ----------------------------------------------------------------------
@@ -447,6 +450,13 @@ with tab_saved:
             if st.button("🗑️ Supprimer ce modèle", key=f"del_{row['id']}"):
                 store.delete_model(row["id"])
                 st.rerun()
+
+
+# ----------------------------------------------------------------------
+# Onglet Prochains matchs
+# ----------------------------------------------------------------------
+with tab_upcoming:
+    render_upcoming()
 
 
 # ----------------------------------------------------------------------
