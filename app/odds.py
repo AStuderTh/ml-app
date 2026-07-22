@@ -7,12 +7,12 @@ le tournoi (le marché n'existe pas encore avant). Les ATP 250 et tournois
 plus loin dans le calendrier n'auront donc pas de cotes — c'est une
 limite du fournisseur de données, pas un bug de l'app."""
 import os
-import re
-import unicodedata
 
 import pandas as pd
 import requests
 import streamlit as st
+
+from app.name_utils import normalize_name as _normalize_name
 
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
@@ -61,12 +61,6 @@ def sport_key_for_tournament(tourney_name: str) -> str | None:
         if substr in name:
             return key
     return None
-
-
-def _normalize_name(name: str) -> str:
-    name = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode()
-    name = re.sub(r"[^a-z\s]", "", name.lower())
-    return " ".join(name.split())
 
 
 @st.cache_data(ttl=3600, show_spinner=False)

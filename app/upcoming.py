@@ -8,6 +8,14 @@ import requests
 import streamlit as st
 
 from app.odds import attach_odds, sport_key_for_tournament
+from app.oddsapiio import attach_oddsapiio_odds
+from app.polymarket import attach_polymarket_odds
+
+ODDS_PROVIDERS = {
+    "Aucune": None,
+    "💰 The Odds API": "the_odds_api",
+    "🎾 odds-api.io": "odds_api_io",
+}
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
 DISPLAY_TZ = "Europe/Paris"
@@ -108,25 +116,62 @@ def render_upcoming():
     df = df[df["tournoi"].isin(selected)]
 
     covered = {t for t in tournois if sport_key_for_tournament(t)}
-    c4, c5 = st.columns([1, 3])
-    show_odds = c4.checkbox("💰 Récupérer les cotes", value=False, key="upc_show_odds")
-    c5.caption(
-        "Cotes via The Odds API — couverture limitée aux Grand Chelems / Masters / ATP 500, "
-        "et seulement une fois le marché ouvert (quelques jours avant le tournoi). "
-        f"Tournoi(s) sélectionné(s) couvert(s) par ce fournisseur : {', '.join(sorted(covered)) or 'aucun'}."
+
+    # Polymarket: toujours récupéré et affiché (gratuit, sans clé, large couverture)
+    df, pm_info = attach_polymarket_odds(df)
+    st.caption(
+        "📊 Polymarket (marché prédictif, sans bookmaker) — toujours affiché, couvre tour "
+        "principal ET Challengers, mais un marché n'existe que si le tirage au sort du tour "
+        "est déjà sorti. Probabilité implicite (%) + cote décimale équivalente (1/proba). "
+        + (pm_info or "")
     )
 
-    quota_info = None
-    if show_odds:
-        df, quota_info = attach_odds(df)
-        if quota_info == "no_key":
+    c4, c5 = st.columns([1, 3])
+    provider_label = c4.selectbox(
+        "Fournisseur de cotes bookmaker (en plus de Polymarket)",
+        list(ODDS_PROVIDERS.keys()), key="upc_odds_provider",
+    )
+    provider = ODDS_PROVIDERS[provider_label]
+
+    PROVIDER_CAPTIONS = {
+        "the_odds_api": (
+            "The Odds API — couverture limitée aux Grand Chelems / Masters / ATP 500, et seulement "
+            "une fois le marché ouvert (quelques jours avant le tournoi). "
+            f"Tournoi(s) sélectionné(s) couvert(s) : {', '.join(sorted(covered)) or 'aucun'}."
+        ),
+        "odds_api_io": (
+            "odds-api.io — couvre aussi les ATP 250 et Challengers. Plan gratuit limité à 2 "
+            "bookmakers imposés (Bwin FR, Winamax FR), meilleure cote entre les deux affichée."
+        ),
+    }
+    if provider:
+        c5.caption(PROVIDER_CAPTIONS[provider])
+
+    info = None
+    if provider == "the_odds_api":
+        df, info = attach_odds(df)
+        if info == "no_key":
             st.warning("Aucune clé ODDS_API_KEY configurée dans .streamlit/secrets.toml.")
-        elif quota_info is not None and not str(quota_info).isdigit():
-            st.warning(f"Erreur The Odds API : {quota_info}")
-        elif quota_info is not None:
-            st.caption(f"Requêtes The Odds API restantes ce mois-ci : {quota_info}")
+        elif info is not None and not str(info).isdigit():
+            st.warning(f"Erreur The Odds API : {info}")
+        elif info is not None:
+            st.caption(f"Requêtes The Odds API restantes ce mois-ci : {info}")
+    elif provider == "odds_api_io":
+        df, info = attach_oddsapiio_odds(df)
+        if info == "no_key":
+            st.warning("Aucune clé ODDS_API_IO_KEY configurée dans .streamlit/secrets.toml.")
+        elif info:
+            st.caption(info)
 
     st.caption(f"{len(df)} matchs à venir sur la période sélectionnée")
+
+    def _fmt_decimal(v):
+        return f"{v:.2f}" if pd.notna(v) else "—"
+
+    def _fmt_pm(v):
+        if pd.isna(v) or v <= 0:
+            return "—"
+        return f"{v*100:.1f}% ({1/v:.2f})"
 
     for tourney in tournois:
         sub = df[df["tournoi"] == tourney]
@@ -137,10 +182,22 @@ def render_upcoming():
             display["Date"] = display["date_locale"].dt.strftime("%a %d/%m %H:%M")
             cols = ["Date", "round", "joueur_1", "joueur_2", "lieu"]
             rename = {"round": "Round", "joueur_1": "Joueur 1", "joueur_2": "Joueur 2", "lieu": "Lieu"}
-            if show_odds and tourney in covered:
-                display["cote_j1"] = display["cote_j1"].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
-                display["cote_j2"] = display["cote_j2"].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+
+            # Polymarket: toujours affiché
+            display["pm_j1"] = display["pm_prob_j1"].apply(_fmt_pm)
+            display["pm_j2"] = display["pm_prob_j2"].apply(_fmt_pm)
+            cols += ["pm_j1", "pm_j2"]
+            rename.update({"pm_j1": "Polymarket J1", "pm_j2": "Polymarket J2"})
+
+            if provider == "the_odds_api":
+                display["cote_j1"] = display["cote_j1"].apply(_fmt_decimal)
+                display["cote_j2"] = display["cote_j2"].apply(_fmt_decimal)
                 cols += ["cote_j1", "cote_j2"]
-                rename.update({"cote_j1": "Cote J1", "cote_j2": "Cote J2"})
+                rename.update({"cote_j1": "Cote J1 (TOA)", "cote_j2": "Cote J2 (TOA)"})
+            elif provider == "odds_api_io":
+                display["oio_j1"] = display["oio_j1"].apply(_fmt_decimal)
+                display["oio_j2"] = display["oio_j2"].apply(_fmt_decimal)
+                cols += ["oio_j1", "oio_j2"]
+                rename.update({"oio_j1": "Cote J1 (odds.io)", "oio_j2": "Cote J2 (odds.io)"})
             display = display[cols].rename(columns=rename)
             st.dataframe(display, width="stretch", hide_index=True)
