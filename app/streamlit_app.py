@@ -14,10 +14,11 @@ from app.backtest import DEFAULT_STRATEGY
 from app.bruteforce import run_bruteforce
 from app.data import ODDS_CHOICES, load_matches
 from app.data_management import render_data_management
-from app.features import FEATURE_POOL, build_training_frame, compute_chronological_features
+from app.features import FEATURE_POOL, build_training_frame, compute_chronological_features, expand_features
 from app.modeling import ALGOS
 from app.train import train_and_evaluate
 from app.upcoming import render_upcoming
+from app.validation import run_walk_forward
 
 st.set_page_config(page_title="Tennis ML Lab", layout="wide")
 
@@ -34,6 +35,15 @@ GLOSSARY = {
                     "Positif = p1 est jugé plus fort. Ex: +200 signifie un net avantage pour p1 (~76% de proba théorique).",
         "elo_surface_diff": "Même principe que elo_diff, mais le rating est recalculé séparément par surface "
                             "(un joueur peut être fort sur terre battue et faible sur gazon). Capture la spécialisation surface.",
+        "elo_diff_recent": "Comme elo_diff, mais régressé vers la moyenne (1500) en fonction du temps écoulé depuis "
+                           "le dernier match connu du joueur (demi-vie 1 an): un rating vieux de plusieurs années pèse "
+                           "moins qu'un rating tout juste mis à jour. Utile pour ne pas surestimer un joueur inactif.",
+        "elo_surface_diff_recent": "Comme elo_surface_diff, mais avec la même régression temporelle appliquée à la "
+                                   "dernière fois où le joueur a joué SUR CETTE SURFACE précise (un joueur peut être "
+                                   "très actif en général mais n'avoir pas touché la terre battue depuis longtemps).",
+        "surface": "Développe automatiquement 3 features one-hot (surface_clay, surface_grass, surface_hard — Carpet "
+                  "en catégorie de référence implicite). Permet au modèle d'apprendre un ajustement direct par "
+                  "surface, en complément (pas en remplacement) de elo_surface_diff.",
         "rank_diff": "Écart de classement ATP officiel (rang p2 - rang p1). Positif = p1 mieux classé (rang plus petit). "
                     "Ex: p1 classé 10, p2 classé 50 -> rank_diff = +40.",
         "rank_points_diff": "Écart de points au classement ATP (p1 - p2). Plus fin que rank_diff car reflète l'écart de "
@@ -188,6 +198,10 @@ def render_calibration(test_frame: pd.DataFrame, key_prefix: str):
 
 def render_feature_importance(model, features, key_prefix: str):
     est = model
+    # si modèle calibré (CalibratedClassifierCV sur FrozenEstimator), on redescend
+    # jusqu'à l'estimateur de base réellement entraîné
+    if hasattr(est, "calibrated_classifiers_"):
+        est = est.calibrated_classifiers_[0].estimator.estimator
     # si pipeline (StandardScaler + estimateur), on prend le dernier step
     if hasattr(est, "steps"):
         est = est.steps[-1][1]
@@ -297,9 +311,19 @@ tab_brute, tab_manual, tab_saved, tab_upcoming, tab_data = st.tabs(
 # ----------------------------------------------------------------------
 with tab_brute:
     st.subheader("Génération aléatoire de modèles")
-    c1, c2 = st.columns([1, 1])
+    c1, c2, c3 = st.columns([1, 1, 1])
     n_models = c1.number_input("Nombre de modèles", min_value=1, max_value=500, value=25, key="bf_n")
     seed = c2.number_input("Seed", min_value=0, value=0, key="bf_seed")
+    bf_surface = c3.selectbox(
+        "Surface (pour ce bruteforce)", ["Toutes les surfaces sélectionnées"] + selected_surfaces, key="bf_surface",
+    )
+
+    bf_train_frame, bf_test_frame = train_frame, test_frame
+    if bf_surface != "Toutes les surfaces sélectionnées":
+        bf_train_frame = train_frame[train_frame["surface"] == bf_surface]
+        bf_test_frame = test_frame[test_frame["surface"] == bf_surface]
+    st.caption(f"Données utilisées pour ce bruteforce : {len(bf_train_frame)} train / {len(bf_test_frame)} test "
+               f"({bf_surface}).")
 
     st.caption("Algorithmes autorisés (tirés au hasard parmi ceux cochés)")
     algo_items = list(ALGOS.items())
@@ -314,17 +338,25 @@ with tab_brute:
     feat_cols = st.columns(4)
     bf_features_allowed = []
     for i, feat in enumerate(FEATURE_POOL):
-        if feat_cols[i % 4].checkbox(feat, value=True, key=f"bf_feat_{feat}"):
+        # implied_prob_p1 décochée par défaut: un modèle qui apprend en partie sur la cote du
+        # marché n'est plus comparable indépendamment à ce même marché (cf. onglet Données).
+        default_checked = feat != "implied_prob_p1"
+        if feat_cols[i % 4].checkbox(feat, value=default_checked, key=f"bf_feat_{feat}"):
             bf_features_allowed.append(feat)
     bf_features_allowed = bf_features_allowed or FEATURE_POOL
+    st.caption(
+        "⚠️ `implied_prob_p1` (probabilité du marché) comme feature: risque que le modèle se contente de "
+        "reproduire le marché plutôt que de détecter un edge indépendant — décoche-la pour des modèles "
+        "vraiment indépendants du marché. `surface` développe 3 colonnes one-hot (Clay/Grass/Hard)."
+    )
 
     if st.button("🚀 Lancer le bruteforce", type="primary"):
-        if train_frame.empty or test_frame.empty:
-            st.error("Pas assez de données sur la période choisie (train ou test vide).")
+        if bf_train_frame.empty or bf_test_frame.empty:
+            st.error("Pas assez de données sur la période/surface choisies (train ou test vide).")
         else:
             progress = st.progress(0.0)
             rows, results = [], []
-            for i, result, err in run_bruteforce(train_frame, test_frame, int(n_models), algos_allowed,
+            for i, result, err in run_bruteforce(bf_train_frame, bf_test_frame, int(n_models), algos_allowed,
                                                   seed=int(seed), feature_pool=bf_features_allowed):
                 progress.progress((i + 1) / n_models)
                 if result is None:
@@ -333,9 +365,12 @@ with tab_brute:
                 rows.append({
                     "#": i, "algo": ALGOS[result["algo"]]["label"], "n_features": len(result["features"]),
                     "edge": result["strategy"]["edge_threshold"], "stake": result["strategy"]["stake_mode"],
+                    "brier": round(m["brier"], 4) if m["brier"] == m["brier"] else None,
+                    "logloss": round(m["logloss"], 4) if m["logloss"] == m["logloss"] else None,
+                    "auc": round(m["auc"], 3) if m["auc"] == m["auc"] else None,
+                    "calibré": m.get("calibrated", False),
                     "n_bets": bt["n_bets"], "roi_%": round(bt["roi"] * 100, 2),
                     "profit": round(bt["total_profit"], 1), "win_rate_%": round(bt["win_rate"] * 100, 1),
-                    "auc": round(m["auc"], 3) if m["auc"] == m["auc"] else None,
                     "max_drawdown_%": round(bt["max_drawdown"] * 100, 1),
                 })
                 results.append(result)
@@ -346,9 +381,17 @@ with tab_brute:
     rows = st.session_state.get("bf_rows", [])
     results = st.session_state.get("bf_results", [])
     if rows:
-        st.caption("Clique sur une ligne pour voir le détail (graphs, stats) et pouvoir la sauvegarder. "
-                   "Clique sur un en-tête de colonne pour trier (ex: par roi_% ou profit).")
+        st.caption(
+            "Trié par défaut par Brier score croissant (le plus bas = le mieux calibré) — c'est le critère "
+            "de sélection recommandé, ROI/profit ne sont que des indicateurs secondaires (cf. onglet Données "
+            "pour l'explication). Clique sur une ligne pour voir le détail, ou sur un en-tête de colonne pour "
+            "trier autrement (ex: roi_%)."
+        )
         df_rows = pd.DataFrame(rows)
+        sorted_df = df_rows.sort_values("brier", ascending=True, na_position="last", kind="stable")
+        sort_order = sorted_df.index.to_numpy()
+        df_rows = sorted_df.reset_index(drop=True)
+        results = [results[i] for i in sort_order]
         event = st.dataframe(
             df_rows, width="stretch", hide_index=True,
             on_select="rerun", selection_mode="single-row", key="bf_table",
@@ -385,8 +428,16 @@ with tab_manual:
     feat_cols = st.columns(4)
     features = []
     for i, feat in enumerate(FEATURE_POOL):
-        if feat_cols[i % 4].checkbox(feat, value=True, key=f"man_feat_{feat}"):
+        default_checked = feat != "implied_prob_p1"
+        if feat_cols[i % 4].checkbox(feat, value=default_checked, key=f"man_feat_{feat}"):
             features.append(feat)
+    st.caption(
+        "⚠️ `implied_prob_p1` (probabilité du marché) comme feature d'entraînement: le modèle peut se "
+        "contenter de reproduire le marché plutôt que de détecter un edge indépendant. Pour identifier de "
+        "vraies divergences model vs marché, entraîne plutôt sans cette feature et compare après coup "
+        "(c'est déjà ce que fait le backtest, indépendamment de ce choix). "
+        "`surface` développe automatiquement 3 colonnes one-hot (Clay/Grass/Hard, Carpet en référence)."
+    )
 
     st.markdown("**Stratégie de mise**")
     c1, c2, c3, c4 = st.columns(4)
@@ -406,12 +457,84 @@ with tab_manual:
             st.error("Pas assez de données sur la période choisie (train ou test vide).")
         else:
             with st.spinner("Entraînement en cours..."):
-                result = train_and_evaluate(train_frame, test_frame, algo_key, params, features, strategy)
+                result = train_and_evaluate(train_frame, test_frame, algo_key, params,
+                                             expand_features(features), strategy)
             st.session_state["manual_result"] = result
 
     if st.session_state.get("manual_result"):
         st.divider()
         render_result_detail(st.session_state["manual_result"], key_prefix="manual")
+
+    st.divider()
+    st.markdown("#### 🔁 Validation glissante (walk-forward)")
+    st.caption(
+        "Réentraîne CETTE configuration (algo/hyperparamètres/features/stratégie ci-dessus) sur plusieurs "
+        "fenêtres temporelles successives (entraînement extensible, test glissant), puis sur une tranche de "
+        "confirmation finale jamais vue pendant la recherche. Un modèle qui n'est bon que sur une seule "
+        "coupure train/test peut avoir simplement eu de la chance — la stabilité d'AUC/Brier sur plusieurs "
+        "fenêtres est un bien meilleur indicateur de fiabilité qu'un seul run."
+    )
+    wc1, wc2, wc3, wc4 = st.columns(4)
+    wf_n_windows = wc1.slider("Nombre de fenêtres", 2, 8, 4, key="wf_n_windows")
+    wf_test_months = wc2.slider("Durée de test par fenêtre (mois)", 1, 12, 6, key="wf_test_months")
+    wf_min_train_months = wc3.slider("Entraînement minimum (mois)", 6, 60, 24, key="wf_min_train")
+    wf_holdout_months = wc4.slider("Confirmation finale (mois)", 1, 12, 6, key="wf_holdout")
+
+    if st.button("🔁 Lancer la validation glissante", key="wf_run_btn"):
+        if not features:
+            st.error("Sélectionne au moins une feature.")
+        else:
+            odds_w, odds_l = ODDS_CHOICES[odds_label]
+            with st.spinner("Validation glissante en cours (plusieurs entraînements successifs)..."):
+                try:
+                    wf_windows, wf_holdout, wf_holdout_bounds = run_walk_forward(
+                        dataset, odds_w, odds_l, algo_key, params, expand_features(features), strategy,
+                        n_windows=wf_n_windows, test_months=wf_test_months,
+                        min_train_months=wf_min_train_months, holdout_months=wf_holdout_months,
+                    )
+                    st.session_state["wf_result"] = (wf_windows, wf_holdout, wf_holdout_bounds)
+                except ValueError as e:
+                    st.error(str(e))
+                    st.session_state.pop("wf_result", None)
+
+    if st.session_state.get("wf_result"):
+        wf_windows, wf_holdout, wf_holdout_bounds = st.session_state["wf_result"]
+        if not wf_windows:
+            st.warning("Aucune fenêtre exploitable avec ces paramètres (pas assez de matchs avec cotes).")
+        else:
+            wf_rows = []
+            for wr in wf_windows:
+                w, r = wr["window"], wr["result"]
+                m, bt = r["metrics"], r["backtest_metrics"]
+                wf_rows.append({
+                    "Fenêtre test": f"{w['test_start'].date()} → {w['test_end'].date()}",
+                    "n_test": m["n_test"], "AUC": round(m["auc"], 3), "Brier": round(m["brier"], 4),
+                    "LogLoss": round(m["logloss"], 4), "roi_%": round(bt["roi"] * 100, 2),
+                    "n_bets": bt["n_bets"],
+                })
+            wf_df = pd.DataFrame(wf_rows)
+            agg = wf_df[["AUC", "Brier", "LogLoss", "roi_%"]].agg(["mean", "std"]).round(4)
+            st.dataframe(wf_df, width="stretch", hide_index=True)
+            c1, c2 = st.columns(2)
+            c1.metric("AUC moyen (± écart-type)", f"{agg.loc['mean','AUC']:.3f} ± {agg.loc['std','AUC']:.3f}")
+            c2.metric("Brier moyen (± écart-type)", f"{agg.loc['mean','Brier']:.4f} ± {agg.loc['std','Brier']:.4f}")
+            st.caption(
+                f"ROI moyen sur les {len(wf_df)} fenêtres : {agg.loc['mean','roi_%']:.1f}% "
+                f"(écart-type {agg.loc['std','roi_%']:.1f} pts) — une forte variabilité d'une fenêtre à "
+                "l'autre est un signe que le ROI observé n'est pas fiable."
+            )
+
+            st.markdown("**🔒 Confirmation finale (jamais vue pendant la recherche)**")
+            if wf_holdout is None:
+                st.warning("Pas assez de données sur la période de confirmation pour l'évaluer.")
+            else:
+                hm, hbt = wf_holdout["metrics"], wf_holdout["backtest_metrics"]
+                st.caption(f"{wf_holdout_bounds['test_start'].date()} → {wf_holdout_bounds['test_end'].date()}")
+                hc1, hc2, hc3, hc4 = st.columns(4)
+                hc1.metric("AUC", f"{hm['auc']:.3f}")
+                hc2.metric("Brier", f"{hm['brier']:.4f}")
+                hc3.metric("ROI", f"{hbt['roi']*100:.1f}%")
+                hc4.metric("Paris placés", f"{hbt['n_bets']}")
 
 
 # ----------------------------------------------------------------------
@@ -456,7 +579,7 @@ with tab_saved:
 # Onglet Prochains matchs
 # ----------------------------------------------------------------------
 with tab_upcoming:
-    render_upcoming()
+    render_upcoming(dataset)
 
 
 # ----------------------------------------------------------------------

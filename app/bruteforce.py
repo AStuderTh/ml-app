@@ -3,7 +3,7 @@ tous entraînés/backtestés sur la même période (pour que le classement par
 ROI reste comparable d'un modèle à l'autre)."""
 import numpy as np
 
-from .features import FEATURE_POOL
+from .features import FEATURE_POOL, expand_features
 from .modeling import ALGOS, sample_random_params
 from .train import train_and_evaluate
 
@@ -17,7 +17,7 @@ def sample_config(rng: np.random.Generator, algos_allowed, feature_pool=None, mi
 
     min_features = min(min_features, len(feature_pool))
     n_feat = int(rng.integers(min_features, len(feature_pool) + 1))
-    features = list(rng.choice(feature_pool, size=n_feat, replace=False))
+    features = expand_features(list(rng.choice(feature_pool, size=n_feat, replace=False)))
 
     strategy = {
         "edge_threshold": float(rng.uniform(0.0, 0.10)),

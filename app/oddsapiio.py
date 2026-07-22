@@ -11,7 +11,7 @@ import streamlit as st
 from app.name_utils import normalize_name
 
 BASE = "https://api.odds-api.io/v3"
-FREE_BOOKMAKERS = ["Bwin FR", "Winamax FR"]  # imposés par le plan gratuit
+FREE_BOOKMAKERS = ["Bet365", "Winamax FR"]  # imposés par le plan gratuit
 
 
 def _get_api_key():
@@ -68,8 +68,9 @@ def _fetch_event_odds(event_id):
 
 
 def attach_oddsapiio_odds(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
-    """Ajoute oio_j1/oio_j2 (meilleure cote décimale parmi Bwin FR/Winamax FR)
-    au dataframe de matchs à venir, en matchant sur les noms de famille des
+    """Ajoute oio_j1/oio_j2 (meilleure cote décimale parmi les bookmakers
+    autorisés par le plan, cf. FREE_BOOKMAKERS) au dataframe de matchs à
+    venir, en matchant sur les noms de famille des
     2 joueurs (+ tolérance 24h sur l'heure). Retourne (df enrichi, info)."""
     df = df.copy()
     df["oio_j1"] = pd.NA
