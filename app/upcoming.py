@@ -86,6 +86,13 @@ def render_upcoming():
     hide_tbd = c2.checkbox("Masquer les 'TBD'", value=False, key="upc_hide_tbd")
     if c3.button("🔄 Rafraîchir le calendrier"):
         get_upcoming_matches.clear()
+        fresh_df = get_upcoming_matches(days_ahead)
+        # assignation explicite (pas juste un pop) puis rerun: c'est ce qui force le
+        # widget multiselect à se resynchroniser visuellement avec "tout sélectionné"
+        # (un simple pop + default laisse parfois le widget affiché vide malgré une
+        # valeur interne correcte)
+        st.session_state["upc_tournois"] = list(dict.fromkeys(fresh_df["tournoi"])) if not fresh_df.empty else []
+        st.rerun()
 
     df = get_upcoming_matches(days_ahead)
     if df.empty:
@@ -97,6 +104,7 @@ def render_upcoming():
 
     tournois = list(dict.fromkeys(df["tournoi"]))  # ordre d'apparition (par date), sans doublons
     selected = st.multiselect("Tournois", tournois, default=tournois, key="upc_tournois")
+    selected = selected or tournois  # sélection vide -> on affiche quand même tout
     df = df[df["tournoi"].isin(selected)]
 
     covered = {t for t in tournois if sport_key_for_tournament(t)}
