@@ -8,10 +8,12 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from app.api_cache import cached_call
 from app.name_utils import normalize_name
 
 BASE = "https://api.odds-api.io/v3"
 FREE_BOOKMAKERS = ["Bet365", "Winamax FR"]  # imposés par le plan gratuit
+CACHE_TTL_SECONDS = 900  # 15mn — cf. app.api_cache (persiste sur disque, survit aux redémarrages)
 
 
 def _get_api_key():
@@ -30,29 +32,33 @@ def _surname(name_raw: str, name_norm: str) -> str:
     return name_norm.split()[-1] if name_norm else ""
 
 
-@st.cache_data(ttl=900, show_spinner=False)
 def _fetch_pending_events(limit: int = 300):
     api_key = _get_api_key()
     if not api_key:
         return None, "no_key"
-    try:
+
+    def _do():
         resp = requests.get(
             f"{BASE}/events",
             params={"apiKey": api_key, "sport": "tennis", "status": "pending", "limit": limit},
             timeout=20,
         )
         resp.raise_for_status()
-        return resp.json(), None
+        return {"events": resp.json()}
+
+    try:
+        result = cached_call(f"oddsapiio_pending_events_{limit}", CACHE_TTL_SECONDS, _do)
     except Exception as e:
         return None, str(e)
+    return result["events"], None
 
 
-@st.cache_data(ttl=900, show_spinner=False)
 def _fetch_event_odds(event_id):
     api_key = _get_api_key()
     if not api_key:
         return None, "no_key"
-    try:
+
+    def _do():
         resp = requests.get(
             f"{BASE}/odds",
             params={"apiKey": api_key, "eventId": event_id, "bookmakers": ",".join(FREE_BOOKMAKERS)},
@@ -61,10 +67,14 @@ def _fetch_event_odds(event_id):
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, dict) and "error" in data:
-            return None, data["error"]
-        return data, None
+            raise RuntimeError(data["error"])
+        return {"data": data}
+
+    try:
+        result = cached_call(f"oddsapiio_event_odds_{event_id}", CACHE_TTL_SECONDS, _do)
     except Exception as e:
         return None, str(e)
+    return result["data"], None
 
 
 def attach_oddsapiio_odds(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:

@@ -1,13 +1,18 @@
-"""Génère N modèles à hyperparamètres/paramètres de stratégie aléatoires,
-tous entraînés/backtestés sur la même période (pour que le classement par
-ROI reste comparable d'un modèle à l'autre)."""
+"""Génère N modèles à hyperparamètres aléatoires, tous entraînés/backtestés
+sur la même période, pour comparer leur QUALITÉ PRÉDICTIVE (cf. app.scoring.
+compute_quality_score) — indépendamment de toute stratégie de mise.
+
+La stratégie de backtest est FIXE (DEFAULT_STRATEGY) pour tous les modèles
+générés ici, pas tirée au hasard: on ne cherche pas le meilleur ROI dans ce
+module (cf. app.roi_bruteforce pour ça, une fois un bon modèle choisi), le
+ROI/n_bets affichés ne servent qu'à titre informatif, sur une base de
+comparaison commune."""
 import numpy as np
 
+from .backtest import DEFAULT_STRATEGY
 from .features import FEATURE_POOL, expand_features
 from .modeling import ALGOS, sample_random_params
 from .train import train_and_evaluate
-
-STAKE_MODES = ["flat", "kelly"]
 
 
 def sample_config(rng: np.random.Generator, algos_allowed, feature_pool=None, min_features=3):
@@ -19,14 +24,7 @@ def sample_config(rng: np.random.Generator, algos_allowed, feature_pool=None, mi
     n_feat = int(rng.integers(min_features, len(feature_pool) + 1))
     features = expand_features(list(rng.choice(feature_pool, size=n_feat, replace=False)))
 
-    strategy = {
-        "edge_threshold": float(rng.uniform(0.0, 0.10)),
-        "stake_mode": STAKE_MODES[rng.integers(0, len(STAKE_MODES))],
-        "flat_stake": 1.0,
-        "kelly_fraction": float(rng.uniform(0.1, 1.0)),
-        "bankroll": 100.0,
-    }
-    return algo, params, features, strategy
+    return algo, params, features, dict(DEFAULT_STRATEGY)
 
 
 def run_bruteforce(train_frame, test_frame, n_models: int, algos_allowed, seed: int = 0, feature_pool=None):

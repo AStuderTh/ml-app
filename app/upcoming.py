@@ -4,6 +4,7 @@ ESPN, site.api.espn.com — pas de clé requise) pour les tournois en cours ou
 sélectionné dans la liste pour afficher ses stats et une prédiction d'un
 modèle ML sauvegardé."""
 import datetime as dt
+import json
 
 import pandas as pd
 import requests
@@ -104,7 +105,62 @@ def _guess_surface(tourney_name: str, dataset: pd.DataFrame) -> str:
     return surf.iloc[-1] if not surf.empty else "Hard"
 
 
-def _render_match_detail(match: dict, dataset: pd.DataFrame):
+def _implied_prob_from_row(row) -> float | None:
+    """Probabilité implicite p1 à utiliser comme feature d'entrée du modèle
+    (si le modèle l'utilise): priorité au bookmaker actuellement attaché au
+    tableau (The Odds API ou odds-api.io), Polymarket en repli — même
+    logique que dans _render_match_detail."""
+    for o1_col, o2_col in (("cote_j1", "cote_j2"), ("oio_j1", "oio_j2")):
+        o1, o2 = row.get(o1_col), row.get(o2_col)
+        if pd.notna(o1) and pd.notna(o2) and o1 > 1 and o2 > 1:
+            i1, i2 = 1.0 / float(o1), 1.0 / float(o2)
+            return i1 / (i1 + i2)
+    p1, p2 = row.get("pm_prob_j1"), row.get("pm_prob_j2")
+    if pd.notna(p1) and pd.notna(p2) and p1 > 0 and p2 > 0:
+        return float(p1)
+    return None
+
+
+def _attach_model_predictions(sub: pd.DataFrame, model_row, state: dict) -> pd.DataFrame:
+    """Ajoute model_prob_j1/model_prob_j2 (probabilité de victoire prédite
+    par le modèle sauvegardé sélectionné au-dessus du tableau) à chaque
+    ligne de `sub`, en réutilisant l'état courant des joueurs déjà calculé
+    (`state`, cf. compute_current_player_state). Reste à NaN si un joueur
+    est TBD, introuvable dans l'historique, ou si une feature requise par le
+    modèle est manquante pour ce match."""
+    sub = sub.copy()
+    sub["model_prob_j1"] = pd.NA
+    sub["model_prob_j2"] = pd.NA
+    if model_row is None or state is None:
+        return sub
+
+    model = store.load_model_object(model_row["id"])
+    if model is None:
+        return sub
+    features = json.loads(model_row["features_json"])
+
+    for i, row in sub.iterrows():
+        if row["joueur_1"] == "TBD" or row["joueur_2"] == "TBD":
+            continue
+        canon1 = resolve_player(row["joueur_1"], state)
+        canon2 = resolve_player(row["joueur_2"], state)
+        if canon1 is None or canon2 is None:
+            continue
+        surface = row.get("surface") or "Hard"
+        snap1 = player_snapshot(state, canon1, surface)
+        snap2 = player_snapshot(state, canon2, surface)
+        implied_prob_p1 = _implied_prob_from_row(row)
+        values, missing = build_live_features(snap1, snap2, state, canon1, canon2, features, surface, implied_prob_p1)
+        if missing:
+            continue
+        X = pd.DataFrame([values])[features].values
+        prob_p1 = float(model.predict_proba(X)[0, 1])
+        sub.loc[i, "model_prob_j1"] = prob_p1
+        sub.loc[i, "model_prob_j2"] = 1 - prob_p1
+    return sub
+
+
+def _render_match_detail(match: dict, dataset: pd.DataFrame, model_row=None):
     st.divider()
     st.markdown(f"### 🔍 {match['joueur_1']} vs {match['joueur_2']}")
     st.caption(f"{match['tournoi']} — {match['round']} — {match['date_locale'].strftime('%a %d/%m %H:%M')}")
@@ -134,19 +190,28 @@ def _render_match_detail(match: dict, dataset: pd.DataFrame):
         f"Noms retrouvés dans la base : **{canon1}** vs **{canon2}**."
     )
 
+    def _fmt(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "—"
+        if isinstance(v, pd.Timestamp):
+            return v.strftime("%d/%m/%Y")
+        if isinstance(v, float):
+            return f"{v:.0f}"
+        return str(v)
+
     stat_rows = [
         ("Elo global", f"{snap1['elo']:.0f}", f"{snap2['elo']:.0f}"),
         ("Elo global (pondéré récence)", f"{snap1['elo_recent']:.0f}", f"{snap2['elo_recent']:.0f}"),
         (f"Elo {surface}", f"{snap1['elo_surface']:.0f}", f"{snap2['elo_surface']:.0f}"),
         (f"Elo {surface} (pondéré récence)", f"{snap1['elo_surface_recent']:.0f}", f"{snap2['elo_surface_recent']:.0f}"),
-        ("Classement ATP", snap1["rank"], snap2["rank"]),
-        ("Points ATP", snap1["rank_points"], snap2["rank_points"]),
-        ("Âge (dernier connu)", snap1["age"], snap2["age"]),
-        ("Taille (cm)", snap1["ht"], snap2["ht"]),
-        ("Main", snap1["hand"], snap2["hand"]),
+        ("Classement ATP", _fmt(snap1["rank"]), _fmt(snap2["rank"])),
+        ("Points ATP", _fmt(snap1["rank_points"]), _fmt(snap2["rank_points"])),
+        ("Âge (dernier connu)", _fmt(snap1["age"]), _fmt(snap2["age"])),
+        ("Taille (cm)", _fmt(snap1["ht"]), _fmt(snap2["ht"])),
+        ("Main", _fmt(snap1["hand"]), _fmt(snap2["hand"])),
         ("Forme (10 derniers)", f"{snap1['form']*100:.0f}%", f"{snap2['form']*100:.0f}%"),
-        ("Matchs joués (historique)", snap1["played"], snap2["played"]),
-        ("Dernier match connu", snap1["last_match_date"], snap2["last_match_date"]),
+        ("Matchs joués (historique)", _fmt(snap1["played"]), _fmt(snap2["played"])),
+        ("Dernier match connu", _fmt(snap1["last_match_date"]), _fmt(snap2["last_match_date"])),
     ]
     stats_df = pd.DataFrame(stat_rows, columns=["Stat", match["joueur_1"], match["joueur_2"]])
     st.dataframe(stats_df, width="stretch", hide_index=True)
@@ -178,16 +243,12 @@ def _render_match_detail(match: dict, dataset: pd.DataFrame):
         _add_source_row(comparison, "📊 Polymarket", pm1, pm2, 1 / pm1, 1 / pm2)
 
     st.markdown("#### 🤖 Prédiction d'un modèle sauvegardé")
-    saved = store.list_models()
-    if saved.empty:
-        st.info("Aucun modèle sauvegardé. Entraîne et sauvegarde un modèle dans l'onglet 'Construire un modèle'.")
-    else:
-        labels = [f"{row['name']} ({row['algo']}, AUC {row['auc']:.3f})" for _, row in saved.iterrows()]
-        idx = st.selectbox(
-            "Modèle", range(len(labels)), format_func=lambda i: labels[i], key="upc_model_select",
+    if model_row is None:
+        st.info(
+            "Aucun modèle sauvegardé, ou aucun sélectionné — choisis-en un dans le menu déroulant "
+            "'🤖 Modèle pour les colonnes de prédiction' au-dessus du tableau."
         )
-        model_row = saved.iloc[idx]
-
+    else:
         # implied_prob_p1 utilisé comme FEATURE d'entrée du modèle (si le modèle
         # l'utilise): priorité au bookmaker (cohérent avec les cotes utilisées à
         # l'entraînement), Polymarket en repli.
@@ -195,8 +256,7 @@ def _render_match_detail(match: dict, dataset: pd.DataFrame):
         if comparison:
             implied_prob_p1 = comparison[0]["p1"]
 
-        import json as _json
-        features = _json.loads(model_row["features_json"])
+        features = json.loads(model_row["features_json"])
         values, missing = build_live_features(snap1, snap2, state, canon1, canon2, features, surface, implied_prob_p1)
 
         with st.expander("Détail des features utilisées par ce modèle"):
@@ -300,9 +360,11 @@ def render_upcoming(dataset: pd.DataFrame = None):
     )
 
     c4, c5 = st.columns([1, 3])
+    provider_labels = list(ODDS_PROVIDERS.keys())
+    default_provider_idx = provider_labels.index("🎾 odds-api.io")
     provider_label = c4.selectbox(
         "Fournisseur de cotes bookmaker (en plus de Polymarket)",
-        list(ODDS_PROVIDERS.keys()), key="upc_odds_provider",
+        provider_labels, index=default_provider_idx, key="upc_odds_provider",
     )
     provider = ODDS_PROVIDERS[provider_label]
 
@@ -336,6 +398,24 @@ def render_upcoming(dataset: pd.DataFrame = None):
         elif info:
             st.caption(info)
 
+    st.markdown("#### 🤖 Modèle pour les colonnes de prédiction")
+    saved_models = store.list_models()
+    model_row = None
+    if saved_models.empty:
+        st.caption(
+            "Aucun modèle sauvegardé — entraîne et sauvegarde un modèle dans l'onglet "
+            "'🛠️ Construire un modèle' pour afficher ses prédictions ici."
+        )
+    else:
+        model_labels = [f"{r['name']} ({r['algo']}, AUC {r['auc']:.3f})" for _, r in saved_models.iterrows()]
+        model_idx = st.selectbox(
+            "Modèle sauvegardé (probabilité/cote affichées dans le tableau et le détail d'un match)",
+            range(len(model_labels)), format_func=lambda i: model_labels[i], key="upc_model_select",
+        )
+        model_row = saved_models.iloc[model_idx]
+
+    state = compute_current_player_state(dataset) if (model_row is not None and dataset is not None) else None
+
     st.caption(f"{len(df)} matchs à venir sur la période sélectionnée")
 
     def _fmt_decimal(v):
@@ -353,6 +433,7 @@ def render_upcoming(dataset: pd.DataFrame = None):
         if sub.empty:
             continue
         sub["surface"] = _guess_surface(tourney, dataset) if dataset is not None else None
+        sub = _attach_model_predictions(sub, model_row, state)
         with st.expander(f"🏆 {tourney} ({len(sub)} matchs)", expanded=len(sub) <= 20):
             display = sub.copy()
             display["Date"] = display["date_locale"].dt.strftime("%a %d/%m %H:%M")
@@ -377,6 +458,13 @@ def render_upcoming(dataset: pd.DataFrame = None):
                 display["oio_j2"] = display["oio_j2"].apply(_fmt_decimal)
                 cols += ["oio_j1", "oio_j2"]
                 rename.update({"oio_j1": "Cote J1 (odds.io)", "oio_j2": "Cote J2 (odds.io)"})
+
+            if model_row is not None:
+                display["model_j1"] = display["model_prob_j1"].apply(_fmt_pm)
+                display["model_j2"] = display["model_prob_j2"].apply(_fmt_pm)
+                cols += ["model_j1", "model_j2"]
+                rename.update({"model_j1": f"🤖 {model_row['name']} J1", "model_j2": f"🤖 {model_row['name']} J2"})
+
             display = display[cols].rename(columns=rename)
 
             event = st.dataframe(
@@ -388,4 +476,4 @@ def render_upcoming(dataset: pd.DataFrame = None):
                 selected_match = sub.iloc[rows[0]].to_dict()
 
     if selected_match is not None:
-        _render_match_detail(selected_match, dataset)
+        _render_match_detail(selected_match, dataset, model_row)

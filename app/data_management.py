@@ -155,3 +155,73 @@ def render_data_management():
         st.cache_data.clear()
         if st.button("Rafraîchir la page"):
             st.rerun()
+
+
+def render_db_explorer():
+    """Explorateur générique de data/tennis.db: table/colonnes/recherche +
+    requête SQL libre. Connexion ouverte en lecture seule (URI mode=ro) —
+    donc même une requête UPDATE/DELETE tapée par erreur échoue proprement au
+    niveau SQLite plutôt que de dépendre d'un filtrage de texte contournable."""
+    st.subheader("🔍 Explorateur de base de données")
+
+    if not os.path.exists(DB_PATH):
+        st.info("data/tennis.db introuvable — lance d'abord une mise à jour ci-dessus.")
+        return
+
+    st.caption("Lecture seule : aucune requête ci-dessous ne peut modifier data/tennis.db.")
+    con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        tables = pd.read_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name", con
+        )["name"].tolist()
+        table = st.selectbox("Table", tables, key="explorer_table")
+
+        col_info = pd.read_sql(f"PRAGMA table_info('{table}')", con)
+        all_columns = col_info["name"].tolist()
+        total_rows = con.execute(f"SELECT COUNT(*) FROM \"{table}\"").fetchone()[0]
+
+        c1, c2 = st.columns([3, 1])
+        selected_columns = c1.multiselect(
+            "Colonnes affichées", all_columns, default=all_columns, key="explorer_cols",
+        )
+        row_limit = c2.number_input(
+            "Nb de lignes max", min_value=10, max_value=5000, value=200, step=10, key="explorer_limit",
+        )
+        search = st.text_input(
+            "Recherche texte (dans les colonnes texte affichées, ex: un nom de joueur)",
+            key="explorer_search",
+        )
+        st.caption(f"{total_rows:,} lignes au total dans `{table}`.".replace(",", " "))
+
+        cols_sql = ", ".join(f'"{c}"' for c in selected_columns) if selected_columns else "*"
+        query = f'SELECT {cols_sql} FROM "{table}"'
+        params = []
+        if search:
+            text_cols = col_info[col_info["type"].str.upper().str.contains("TEXT", na=False)]["name"].tolist()
+            text_cols = [c for c in text_cols if c in (selected_columns or all_columns)]
+            if text_cols:
+                where = " OR ".join(f'"{c}" LIKE ?' for c in text_cols)
+                query += f" WHERE {where}"
+                params = [f"%{search}%"] * len(text_cols)
+        query += f" LIMIT {int(row_limit)}"
+
+        try:
+            df = pd.read_sql(query, con, params=params)
+            st.caption(f"{len(df)} ligne(s) affichée(s) (clique un en-tête de colonne pour trier).")
+            st.dataframe(df, width="stretch", hide_index=True)
+        except Exception as e:
+            st.error(f"Erreur de requête : {e}")
+
+        with st.expander("Requête SQL personnalisée (lecture seule)"):
+            custom_sql = st.text_area(
+                "SQL", value=f"SELECT * FROM {table} LIMIT 50", key="explorer_custom_sql", height=100,
+            )
+            if st.button("▶️ Exécuter", key="explorer_run_sql"):
+                try:
+                    result_df = pd.read_sql(custom_sql, con)
+                    st.caption(f"{len(result_df)} ligne(s).")
+                    st.dataframe(result_df, width="stretch", hide_index=True)
+                except Exception as e:
+                    st.error(f"Erreur : {e}")
+    finally:
+        con.close()

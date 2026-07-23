@@ -16,6 +16,7 @@ from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_
 
 from .backtest import run_backtest
 from .modeling import build_estimator
+from .scoring import expected_calibration_error
 
 CALIBRATION_FRACTION = 0.15
 MIN_ROWS_FOR_CALIBRATION = 150  # en dessous, la calibration ferait plus de mal que de bien
@@ -72,12 +73,14 @@ def train_and_evaluate(train_frame, test_frame, algo, params, features, strategy
 
     def safe_metrics(y, p):
         if len(np.unique(y)) < 2:
-            return dict(auc=float("nan"), accuracy=float("nan"), logloss=float("nan"), brier=float("nan"))
+            return dict(auc=float("nan"), accuracy=float("nan"), logloss=float("nan"), brier=float("nan"),
+                        ece=float("nan"))
         return dict(
             auc=float(roc_auc_score(y, p)),
             accuracy=float(accuracy_score(y, p >= 0.5)),
             logloss=float(log_loss(y, p, labels=[0, 1])),
             brier=float(brier_score_loss(y, p)),
+            ece=expected_calibration_error(y, p),
         )
 
     metrics = safe_metrics(y_test, probs_test)
