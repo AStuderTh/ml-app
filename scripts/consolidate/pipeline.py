@@ -58,7 +58,7 @@ def run(data_dir: str, review_csv_path: str, sqlite_path: str, verbose=True):
             "a_loser": pr_row["loser_name"], "a_score": pr_row["score"],
             "b_source": "tennis_data", "b_id": td_row["src_row_id"], "b_tourney": td_row["Tournament"],
             "b_date": td_row["Date"], "b_round": td_row["Round"], "b_winner": td_row["Winner"],
-            "b_loser": td_row["Loser"], "b_score": None,
+            "b_loser": td_row["Loser"], "b_score": td_row["score"],
         })
         if decision == "merge":
             trd = td_row.to_dict()
@@ -81,6 +81,19 @@ def run(data_dir: str, review_csv_path: str, sqlite_path: str, verbose=True):
         final_rows.append(row_from_td_only(td.loc[j].to_dict()))
 
     matches_df = pd.DataFrame(final_rows)
+
+    # Ordre chronologique réel, jusqu'à l'intérieur d'un tournoi.
+    # `tourney_date` est la date de DÉBUT du tournoi: elle est identique pour
+    # tous les matchs d'une même édition et ne suffit donc pas à les ordonner.
+    # Sans ce tri, l'ordre des lignes est celui de leur construction ci-dessus
+    # (les paires de l'étape 2 sont produites par rang croissant, donc finale
+    # en premier): les features chronologiques calculées en aval — Elo, forme,
+    # H2H — verraient le résultat de la finale AVANT celui du 1er tour du même
+    # tournoi, et fuiteraient donc du futur dans le passé.
+    matches_df["_round_rank"] = matches_df["round"].map(nm.atp_round_rank)
+    matches_df = matches_df.sort_values(
+        ["tourney_date", "_round_rank"], ascending=[True, False], kind="stable",
+    ).drop(columns="_round_rank").reset_index(drop=True)
 
     dup_mask = matches_df["match_id"].duplicated(keep=False)
     if dup_mask.any():

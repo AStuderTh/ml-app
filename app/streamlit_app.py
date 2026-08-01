@@ -14,11 +14,13 @@ from app import store
 from app.backtest import DEFAULT_STRATEGY, run_backtest
 from app.bruteforce import run_bruteforce
 from app.data import ODDS_CHOICES, load_matches
-from app.data_management import render_data_management, render_db_explorer
-from app.features import FEATURE_POOL, build_training_frame, compute_chronological_features, expand_features
+from app.data_management import render_data_management, render_db_explorer, render_review_queue
+from app.features import (FEATURE_POOL, RETIRED_COMMENT, build_training_frame,
+                          compute_chronological_features, expand_features)
 from app.modeling import ALGOS
 from app.roi_bruteforce import run_roi_bruteforce
-from app.scoring import DEFAULT_WEIGHTS, ROI_SCORE_WEIGHTS, compute_quality_score, compute_roi_score
+from app.scoring import (DEFAULT_WEIGHTS, ROI_SCORE_WEIGHTS, compute_quality_score, compute_roi_score,
+                          compute_return_risk_ratio)
 from app.train import train_and_evaluate
 from app.upcoming import render_upcoming
 from app.validation import run_walk_forward
@@ -144,6 +146,94 @@ def split_train_test(frame: pd.DataFrame, test_start):
     return train, test
 
 
+def render_general_settings(key_prefix: str, min_possible, max_possible, available_surfaces) -> dict:
+    """Réglages qui définissent le jeu de données d'entraînement/test (période,
+    source de cotes, surfaces, réserve de confirmation finale). Dupliqué avec des
+    clés indépendantes dans chaque onglet qui en a besoin (🎲 Bruteforce et 🛠️
+    Construire un modèle — les seuls à consommer train_frame/test_frame): un widget
+    Streamlit ne peut pas être partagé visuellement entre deux onglets, et permettre
+    à chaque onglet de régler sa propre période/réserve indépendamment est cohérent
+    avec le reste de l'app (stratégies de mise déjà dupliquées par contexte)."""
+    st.markdown("##### ⚙️ Paramètres généraux")
+
+    confirmation_months = st.slider(
+        "🔒 Réserve de confirmation finale (mois)", min_value=1, max_value=12, value=6,
+        key=f"{key_prefix}_confirmation_months",
+        help="Les X derniers mois de la base sont mis de côté ci-dessous: ni le bruteforce ni le constructeur "
+             "manuel ne peuvent les voir (impossible de régler une date au-delà). Seule la validation glissante "
+             "(section 🔁 ci-dessous) les évalue, en confirmation finale — ça garantit qu'aucun réglage "
+             "manuel ni aucun tri de résultat bruteforce n'a pu être influencé par cette période avant qu'elle "
+             "serve de test.",
+    )
+    confirmation_start = (pd.Timestamp(max_possible) - pd.DateOffset(months=confirmation_months)).date()
+    # le holdout du walk-forward inclut les matchs du jour confirmation_start lui-même
+    # (tourney_date >= confirmation_start côté validation.py) — donc l'exploration doit
+    # s'arrêter la veille pour qu'aucun match ne soit visible des deux côtés à la fois.
+    exploration_max = (pd.Timestamp(confirmation_start) - pd.Timedelta(days=1)).date()
+    st.caption(
+        f"Zone réservée à la confirmation finale : **{confirmation_start} → {max_possible}** — non explorable "
+        "ci-dessous, y compris dans le bruteforce et le constructeur manuel."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    odds_label = c1.selectbox("Source de cotes (marché de référence)", list(ODDS_CHOICES.keys()),
+                               key=f"{key_prefix}_odds_label")
+    train_start = c2.date_input("Début période d'entraînement", value=max(min_possible, pd.Timestamp("2005-01-01").date()),
+                                 min_value=min_possible, max_value=exploration_max, key=f"{key_prefix}_train_start")
+    test_start = c3.date_input("Début période de test (backtest)", value=pd.Timestamp("2023-01-01").date(),
+                                min_value=min_possible, max_value=exploration_max, key=f"{key_prefix}_test_start")
+    test_end = c4.date_input("Fin période de test", value=exploration_max, min_value=min_possible,
+                              max_value=exploration_max, key=f"{key_prefix}_test_end")
+
+    st.caption("Surfaces à inclure")
+    surf_cols = st.columns(len(available_surfaces) or 1)
+    selected_surfaces = []
+    for i, surf in enumerate(available_surfaces):
+        if surf_cols[i].checkbox(surf, value=True, key=f"{key_prefix}_surf_{surf}"):
+            selected_surfaces.append(surf)
+    selected_surfaces = selected_surfaces or available_surfaces
+
+    exclude_retired = st.checkbox(
+        "Exclure les matchs abandonnés en cours de jeu", value=False,
+        key=f"{key_prefix}_exclude_retired",
+        help="Un abandon désigne bien un vainqueur et les paris sont généralement réglés, ces matchs sont donc "
+             "gardés par défaut. Mais leur issue dépend surtout de l'état physique du joueur, que le modèle ne "
+             "voit pas: les exclure retire ce bruit d'étiquette, au prix d'environ 3 % des lignes. "
+             "(Les forfaits, eux, sont toujours écartés: aucun match n'a été joué.)",
+    )
+
+    full_frame = get_training_frame(odds_label, train_start, test_end)
+    full_frame = full_frame[full_frame["surface"].isin(selected_surfaces)]
+    if exclude_retired and "match_comment" in full_frame.columns:
+        full_frame = full_frame[full_frame["match_comment"] != RETIRED_COMMENT]
+
+    train_frame, test_frame = split_train_test(full_frame, test_start)
+    train_frame = train_frame[train_frame["tourney_date"] >= pd.Timestamp(train_start)]
+    test_frame = test_frame[test_frame["tourney_date"] <= pd.Timestamp(test_end)]
+
+    st.caption(f"{len(full_frame)} matchs avec cotes sur la période/surfaces sélectionnées "
+               f"— Train: {len(train_frame)} · Test: {len(test_frame)}")
+    st.divider()
+
+    # La validation glissante reconstruit son propre jeu à chaque fenêtre, à
+    # partir de l'historique complet: sans ce pré-filtrage, elle évaluerait
+    # sur des surfaces ou des statuts de match que l'exploration a exclus, et
+    # sa confirmation ne porterait donc pas sur la même population.
+    wf_dataset = get_dataset()
+    wf_dataset = wf_dataset[wf_dataset["surface"].isin(selected_surfaces)]
+    if exclude_retired and "match_comment" in wf_dataset.columns:
+        wf_dataset = wf_dataset[wf_dataset["match_comment"] != RETIRED_COMMENT]
+
+    return {
+        "train_frame": train_frame, "test_frame": test_frame,
+        "odds_label": odds_label, "selected_surfaces": selected_surfaces,
+        "train_start": str(train_start), "train_end": str(test_start),
+        "test_start": str(test_start), "test_end": str(test_end),
+        "confirmation_start": confirmation_start, "confirmation_months": confirmation_months,
+        "wf_dataset": wf_dataset,
+    }
+
+
 # ----------------------------------------------------------------------
 # Composants d'affichage partagés
 # ----------------------------------------------------------------------
@@ -175,12 +265,31 @@ def render_quality_score(metrics: dict, key_prefix: str):
 
 def render_backtest_metrics(bt: dict):
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("ROI", f"{bt['roi']*100:.1f}%")
+    c1.metric("ROI", f"{bt['roi']*100:.1f}%",
+              help="Profit / total misé (turnover). Mesure la marge moyenne extraite par mise, "
+                   "mais pas comparable entre flat et kelly: kelly mise proportionnellement plus "
+                   "au fil du temps (les mises grossissent avec la bankroll), ce qui dilue son ROI% "
+                   "sans refléter une moindre rentabilité réelle. Pour comparer la rentabilité "
+                   "réelle entre stratégies, voir 'Rendement/capital' et 'Rendement/risque' ci-dessous.")
     c2.metric("Profit total", f"{bt['total_profit']:.1f} u")
     c3.metric("Paris placés", f"{bt['n_bets']}")
     c4.metric("Taux de réussite", f"{bt['win_rate']*100:.1f}%")
     c5.metric("Drawdown max", f"{bt['max_drawdown']*100:.1f}%")
     c6.metric("Bankroll finale", f"{bt['final_bankroll']:.1f} u")
+
+    rr = compute_return_risk_ratio(bt)
+    d1, d2 = st.columns(2)
+    ror = rr["return_on_bankroll"]
+    d1.metric("Rendement/capital", f"{ror*100:.1f}%" if ror == ror else "n/a",
+              help="Profit total / bankroll de départ. Contrairement au ROI, comparable "
+                   "directement entre stratégies flat et kelly: c'est le multiple réel de "
+                   "croissance de votre capital initial.")
+    calmar = rr["calmar_ratio"]
+    d2.metric("Rendement/risque (Calmar)", f"{calmar:.2f}" if calmar == calmar else "n/a",
+              help="Rendement/capital divisé par le drawdown max. Résume en un seul chiffre "
+                   "la rentabilité RAPPORTÉE au risque de creux traversé pour l'obtenir: plus "
+                   "c'est haut, plus le rendement obtenu compense le risque pris. 'n/a' si le "
+                   "drawdown est quasi nul (rien à rapporter).")
 
 
 def render_model_metrics(metrics: dict):
@@ -201,10 +310,10 @@ def render_metrics(metrics: dict, bt: dict):
 def render_roi_score(backtest_metrics: dict, key_prefix: str):
     result = compute_roi_score(backtest_metrics, ROI_SCORE_WEIGHTS)
     score = result["score"]
-    st.metric("🎯 Score ROI (stratégie)", f"{score:.1f}/100" if score == score else "n/a",
-              help="Note composite pour classer des STRATÉGIES de mise entre elles sur un modèle fixe: "
+    st.metric("🎯 Score ROI (règle)", f"{score:.1f}/100" if score == score else "n/a",
+              help="Note composite pour classer des RÈGLES DE SÉLECTION entre elles sur un modèle fixe: "
                    "ROI 50%, nombre de paris 25% (confiance statistique), drawdown maîtrisé 25%. Sans rapport "
-                   "avec le 🏆 Score de qualité du modèle — ici le modèle ne change pas, seule la stratégie varie.")
+                   "avec le 🏆 Score de qualité du modèle — ici le modèle ne change pas, seule la règle varie.")
     with st.expander("Détail du score ROI"):
         for name, (skill, weight) in result["components"].items():
             if weight <= 0:
@@ -274,7 +383,7 @@ def render_feature_importance(model, features, key_prefix: str):
 
 @st.dialog("Supprimer ce modèle ?")
 def confirm_delete_model(model_id: str, model_name: str):
-    st.write(f"Supprimer définitivement **{model_name}** ainsi que ses stratégies ROI sauvegardées ? "
+    st.write(f"Supprimer définitivement **{model_name}** ainsi que ses règles de sélection sauvegardées ? "
              "Cette action est irréversible.")
     c1, c2 = st.columns(2)
     if c1.button("Annuler", key=f"cancel_del_model_{model_id}"):
@@ -285,14 +394,14 @@ def confirm_delete_model(model_id: str, model_name: str):
         st.rerun()
 
 
-@st.dialog("Supprimer cette stratégie ?")
-def confirm_delete_roi_strategy(strategy_id: str, strategy_name: str):
-    st.write(f"Supprimer définitivement la stratégie **{strategy_name}** ? Cette action est irréversible.")
+@st.dialog("Supprimer cette règle de sélection ?")
+def confirm_delete_selection_rule(rule_id: str, rule_name: str):
+    st.write(f"Supprimer définitivement la règle de sélection **{rule_name}** ? Cette action est irréversible.")
     c1, c2 = st.columns(2)
-    if c1.button("Annuler", key=f"cancel_del_strat_{strategy_id}"):
+    if c1.button("Annuler", key=f"cancel_del_strat_{rule_id}"):
         st.rerun()
-    if c2.button("🗑️ Supprimer définitivement", key=f"confirm_del_strat_{strategy_id}", type="primary"):
-        store.delete_roi_strategy(strategy_id)
+    if c2.button("🗑️ Supprimer définitivement", key=f"confirm_del_strat_{rule_id}", type="primary"):
+        store.delete_selection_rule(rule_id)
         st.rerun()
 
 
@@ -329,7 +438,9 @@ def _load_model_into_manual_constructor(row):
     st.session_state["_loaded_from_saved_name"] = row["name"]
 
 
-def render_result_detail(result: dict, key_prefix: str, odds_label: str = None):
+def render_result_detail(result: dict, key_prefix: str, odds_label: str = None,
+                          train_start: str = None, train_end: str = None,
+                          test_start: str = None, test_end: str = None):
     render_quality_score(result["metrics"], key_prefix)
     render_metrics(result["metrics"], result["backtest_metrics"])
     render_equity_curve(result["bets_df"], key_prefix)
@@ -346,11 +457,132 @@ def render_result_detail(result: dict, key_prefix: str, odds_label: str = None):
         odds_w_col, odds_l_col = ODDS_CHOICES[odds_label] if odds_label else (None, None)
         model_id = store.save_model(
             result, name,
-            train_start=st.session_state.get("train_start"), train_end=st.session_state.get("train_end"),
-            test_start=st.session_state.get("test_start"), test_end=st.session_state.get("test_end"),
+            train_start=train_start, train_end=train_end,
+            test_start=test_start, test_end=test_end,
             odds_w_col=odds_w_col, odds_l_col=odds_l_col,
         )
+        st.session_state[f"saved_model_id_{key_prefix}"] = model_id
         st.success(f"Modèle sauvegardé (id={model_id}).")
+
+
+def render_walk_forward_section(algo_key, params, features, strategy, key_prefix, odds_label,
+                                 confirmation_start, confirmation_months, max_possible, wf_dataset):
+    """Réentraîne (algo/hyperparamètres/features/stratégie) sur plusieurs fenêtres
+    glissantes + la réserve de confirmation finale. Utilisé à la fois par le
+    constructeur manuel (config des widgets) et par l'onglet bruteforce (config
+    figée d'un modèle déjà généré) — le comportement est identique, seule la
+    provenance de la config change."""
+    st.divider()
+    st.markdown("#### 🔁 Validation glissante (walk-forward)")
+    st.caption(
+        "Réentraîne CETTE configuration (algo/hyperparamètres/features/stratégie ci-dessus) sur plusieurs "
+        "fenêtres temporelles successives (entraînement extensible, test glissant), puis sur la tranche de "
+        "confirmation finale définie plus haut (🔒 Réserve de confirmation finale). Un modèle qui n'est bon "
+        "que sur une seule coupure train/test peut avoir simplement eu de la chance — la stabilité d'AUC/Brier "
+        "sur plusieurs fenêtres est un bien meilleur indicateur de fiabilité qu'un seul run."
+    )
+    wc1, wc2, wc3 = st.columns(3)
+    wf_n_windows = wc1.slider("Nombre de fenêtres", 2, 8, 4, key=f"{key_prefix}_wf_n_windows")
+    wf_test_months = wc2.slider("Durée de test par fenêtre (mois)", 1, 12, 6, key=f"{key_prefix}_wf_test_months")
+    wf_min_train_months = wc3.slider("Entraînement minimum (mois)", 6, 60, 24, key=f"{key_prefix}_wf_min_train")
+    st.caption(
+        f"Confirmation finale : **{confirmation_start} → {max_possible}** (réglée dans "
+        "🔒 Réserve de confirmation finale ci-dessus, en haut de page — la même réserve que celle qui limite "
+        "déjà l'exploration, pour garantir qu'elle est réellement jamais vue avant ce test)."
+    )
+
+    result_key = f"{key_prefix}_wf_result"
+    if st.button("🔁 Lancer la validation glissante", key=f"{key_prefix}_wf_run_btn"):
+        if not features:
+            st.error("Sélectionne au moins une feature.")
+        else:
+            odds_w, odds_l = ODDS_CHOICES[odds_label]
+            with st.spinner("Validation glissante en cours (plusieurs entraînements successifs)..."):
+                try:
+                    wf_windows, wf_holdout, wf_holdout_bounds = run_walk_forward(
+                        wf_dataset, odds_w, odds_l, algo_key, params, expand_features(features), strategy,
+                        n_windows=wf_n_windows, test_months=wf_test_months,
+                        min_train_months=wf_min_train_months, holdout_months=confirmation_months,
+                    )
+                    st.session_state[result_key] = (wf_windows, wf_holdout, wf_holdout_bounds)
+                except ValueError as e:
+                    st.error(str(e))
+                    st.session_state.pop(result_key, None)
+
+    if st.session_state.get(result_key):
+        wf_windows, wf_holdout, wf_holdout_bounds = st.session_state[result_key]
+        if not wf_windows:
+            st.warning("Aucune fenêtre exploitable avec ces paramètres (pas assez de matchs avec cotes).")
+        else:
+            wf_rows = []
+            for wr in wf_windows:
+                w, r = wr["window"], wr["result"]
+                m, bt = r["metrics"], r["backtest_metrics"]
+                wf_rows.append({
+                    "Fenêtre test": f"{w['test_start'].date()} → {w['test_end'].date()}",
+                    "n_test": m["n_test"], "AUC": round(m["auc"], 3), "Brier": round(m["brier"], 4),
+                    "LogLoss": round(m["logloss"], 4), "roi_%": round(bt["roi"] * 100, 2),
+                    "n_bets": bt["n_bets"],
+                })
+            wf_df = pd.DataFrame(wf_rows)
+            agg = wf_df[["AUC", "Brier", "LogLoss", "roi_%"]].agg(["mean", "std"]).round(4)
+            st.dataframe(wf_df, width="stretch", hide_index=True, key=f"{key_prefix}_wf_table")
+            c1, c2 = st.columns(2)
+            c1.metric("AUC moyen (± écart-type)", f"{agg.loc['mean','AUC']:.3f} ± {agg.loc['std','AUC']:.3f}")
+            c2.metric("Brier moyen (± écart-type)", f"{agg.loc['mean','Brier']:.4f} ± {agg.loc['std','Brier']:.4f}")
+            st.caption(
+                f"ROI moyen sur les {len(wf_df)} fenêtres : {agg.loc['mean','roi_%']:.1f}% "
+                f"(écart-type {agg.loc['std','roi_%']:.1f} pts) — une forte variabilité d'une fenêtre à "
+                "l'autre est un signe que le ROI observé n'est pas fiable."
+            )
+
+            st.write("")
+            with st.container(border=True):
+                st.markdown("### 🔒 Confirmation finale — jamais vue pendant la recherche")
+                st.caption(
+                    "Contrairement aux fenêtres ci-dessus (qui font partie du réglage de la config), cette "
+                    "tranche est mise de côté AVANT tout entraînement : c'est le seul résultat qui n'est pas "
+                    "exposé au biais de comparaisons multiples du bruteforce ni au réglage manuel des "
+                    "hyperparamètres. Si un chiffre ici doit faire foi, c'est celui-là."
+                )
+                if wf_holdout is None:
+                    st.warning("Pas assez de données sur la période de confirmation pour l'évaluer.")
+                else:
+                    hm, hbt = wf_holdout["metrics"], wf_holdout["backtest_metrics"]
+                    hq = compute_quality_score(hm, DEFAULT_WEIGHTS)
+                    st.markdown(
+                        f"**Période : {wf_holdout_bounds['test_start'].date()} → "
+                        f"{wf_holdout_bounds['test_end'].date()}**"
+                    )
+                    hc1, hc2, hc3, hc4, hc5, hc6 = st.columns(6)
+                    hc1.metric("🏆 Score qualité", f"{hq['score']:.1f}/100" if hq["score"] == hq["score"] else "n/a")
+                    hc2.metric("AUC", f"{hm['auc']:.3f}")
+                    hc3.metric("Brier", f"{hm['brier']:.4f}")
+                    hc4.metric("Log loss", f"{hm['logloss']:.4f}")
+                    hc5.metric("ROI", f"{hbt['roi']*100:.1f}%")
+                    hc6.metric("Paris placés", f"{hbt['n_bets']}")
+
+                    roi_windows = agg.loc["mean", "roi_%"]
+                    roi_holdout = hbt["roi"] * 100
+                    if hbt["n_bets"] == 0:
+                        st.info("Aucun pari déclenché sur la confirmation finale (seuil d'edge jamais atteint).")
+                    elif (roi_windows >= 0) != (roi_holdout >= 0):
+                        st.warning(
+                            f"⚠️ Le signe du ROI s'inverse entre les fenêtres de recherche ({roi_windows:.1f}%) "
+                            f"et la confirmation finale ({roi_holdout:.1f}%) — signe que le ROI trouvé pendant "
+                            "la recherche ne généralise pas, ne pas faire confiance à cette config sur cette base."
+                        )
+                    elif roi_holdout >= 0:
+                        st.success(
+                            f"✅ ROI toujours positif sur du jamais-vu ({roi_holdout:.1f}%, cohérent avec "
+                            f"{roi_windows:.1f}% en moyenne sur les fenêtres de recherche)."
+                        )
+                    else:
+                        st.warning(
+                            f"ROI négatif sur la confirmation finale ({roi_holdout:.1f}%) — cohérent avec les "
+                            f"fenêtres de recherche ({roi_windows:.1f}%), donc pas de biais de sélection, mais "
+                            "pas non plus de quoi exploiter cette config."
+                        )
 
 
 # ----------------------------------------------------------------------
@@ -386,63 +618,18 @@ min_possible = dataset["tourney_date"].min().date()
 max_possible = dataset["tourney_date"].max().date()
 available_surfaces = [s for s in ["Hard", "Clay", "Grass", "Carpet"] if s in set(dataset["surface"].dropna().unique())]
 
-st.subheader("⚙️ Paramètres généraux")
-
-confirmation_months = st.slider(
-    "🔒 Réserve de confirmation finale (mois)", min_value=1, max_value=12, value=6, key="confirmation_months",
-    help="Les X derniers mois de la base sont mis de côté ci-dessous: ni le bruteforce ni le constructeur "
-         "manuel ne peuvent les voir (impossible de régler une date au-delà). Seule la validation glissante "
-         "(onglet Construire un modèle) les évalue, en confirmation finale — ça garantit qu'aucun réglage "
-         "manuel ni aucun tri de résultat bruteforce n'a pu être influencé par cette période avant qu'elle "
-         "serve de test.",
-)
-confirmation_start = (pd.Timestamp(max_possible) - pd.DateOffset(months=confirmation_months)).date()
-# le holdout du walk-forward inclut les matchs du jour confirmation_start lui-même
-# (tourney_date >= confirmation_start côté validation.py) — donc l'exploration doit
-# s'arrêter la veille pour qu'aucun match ne soit visible des deux côtés à la fois.
-exploration_max = (pd.Timestamp(confirmation_start) - pd.Timedelta(days=1)).date()
-st.caption(
-    f"Zone réservée à la confirmation finale : **{confirmation_start} → {max_possible}** — non explorable "
-    "ci-dessous, y compris dans le bruteforce et le constructeur manuel."
-)
-
-c1, c2, c3, c4 = st.columns(4)
-odds_label = c1.selectbox("Source de cotes (marché de référence)", list(ODDS_CHOICES.keys()))
-train_start = c2.date_input("Début période d'entraînement", value=max(min_possible, pd.Timestamp("2005-01-01").date()),
-                             min_value=min_possible, max_value=exploration_max)
-test_start = c3.date_input("Début période de test (backtest)", value=pd.Timestamp("2023-01-01").date(),
-                            min_value=min_possible, max_value=exploration_max)
-test_end = c4.date_input("Fin période de test", value=exploration_max, min_value=min_possible, max_value=exploration_max)
-st.session_state["train_start"], st.session_state["train_end"] = str(train_start), str(test_start)
-st.session_state["test_start"], st.session_state["test_end"] = str(test_start), str(test_end)
-
-st.caption("Surfaces à inclure")
-surf_cols = st.columns(len(available_surfaces) or 1)
-selected_surfaces = []
-for i, surf in enumerate(available_surfaces):
-    if surf_cols[i].checkbox(surf, value=True, key=f"surf_{surf}"):
-        selected_surfaces.append(surf)
-selected_surfaces = selected_surfaces or available_surfaces
-
-full_frame = get_training_frame(odds_label, train_start, test_end)
-full_frame = full_frame[full_frame["surface"].isin(selected_surfaces)]
-
-train_frame, test_frame = split_train_test(full_frame, test_start)
-train_frame = train_frame[train_frame["tourney_date"] >= pd.Timestamp(train_start)]
-test_frame = test_frame[test_frame["tourney_date"] <= pd.Timestamp(test_end)]
-
-st.caption(f"{len(full_frame)} matchs avec cotes sur la période/surfaces sélectionnées "
-           f"— Train: {len(train_frame)} · Test: {len(test_frame)}")
-st.divider()
-
-tab_brute, tab_manual, tab_saved, tab_upcoming, tab_data = st.tabs(
-    ["🎲 Bruteforce", "🛠️ Construire un modèle", "💾 Modèles sauvegardés", "📅 Prochains matchs", "🗄️ Données"]
+tab_brute, tab_manual, tab_saved, tab_strategies, tab_upcoming, tab_data = st.tabs(
+    ["🎲 Bruteforce", "🛠️ Construire un modèle", "💾 Modèles sauvegardés", "🎯 Stratégies",
+     "📅 Prochains matchs", "🗄️ Données"]
 )
 
 # ----------------------------------------------------------------------
 # Onglet Bruteforce
 # ----------------------------------------------------------------------
 with tab_brute:
+    bf_settings = render_general_settings("bf", min_possible, max_possible, available_surfaces)
+    bf_odds_label = bf_settings["odds_label"]
+
     st.subheader("Génération aléatoire de modèles")
     c1, c2, c3 = st.columns([1, 1, 1])
     n_models = c1.number_input(
@@ -452,13 +639,14 @@ with tab_brute:
     )
     seed = c2.number_input("Seed", min_value=0, value=0, key="bf_seed")
     bf_surface = c3.selectbox(
-        "Surface (pour ce bruteforce)", ["Toutes les surfaces sélectionnées"] + selected_surfaces, key="bf_surface",
+        "Surface (pour ce bruteforce)", ["Toutes les surfaces sélectionnées"] + bf_settings["selected_surfaces"],
+        key="bf_surface",
     )
 
-    bf_train_frame, bf_test_frame = train_frame, test_frame
+    bf_train_frame, bf_test_frame = bf_settings["train_frame"], bf_settings["test_frame"]
     if bf_surface != "Toutes les surfaces sélectionnées":
-        bf_train_frame = train_frame[train_frame["surface"] == bf_surface]
-        bf_test_frame = test_frame[test_frame["surface"] == bf_surface]
+        bf_train_frame = bf_train_frame[bf_train_frame["surface"] == bf_surface]
+        bf_test_frame = bf_test_frame[bf_test_frame["surface"] == bf_surface]
     st.caption(f"Données utilisées pour ce bruteforce : {len(bf_train_frame)} train / {len(bf_test_frame)} test "
                f"({bf_surface}).")
 
@@ -556,19 +744,23 @@ with tab_brute:
             st.divider()
             idx = sel[0]
             st.markdown(f"### Détail — modèle #{df_rows.iloc[idx]['#']} ({df_rows.iloc[idx]['algo']})")
-            render_result_detail(results[idx], key_prefix=f"bf_{idx}", odds_label=odds_label)
+            render_result_detail(
+                results[idx], key_prefix=f"bf_{idx}", odds_label=bf_odds_label,
+                train_start=bf_settings["train_start"], train_end=bf_settings["train_end"],
+                test_start=bf_settings["test_start"], test_end=bf_settings["test_end"],
+            )
 
             st.divider()
             st.markdown("#### 🎯 Bruteforce ROI — optimiser la stratégie de mise pour ce modèle")
             st.caption(
                 "Le modèle ci-dessus reste figé (mêmes probabilités prédites) — seule la stratégie de mise "
                 "(seuil d'edge, mode flat/kelly) est testée en masse pour trouver le meilleur ROI. Sauvegarde "
-                "d'abord le modèle (bouton 💾 ci-dessus) si tu veux aussi garder une stratégie ROI associée — "
+                "d'abord le modèle (bouton 💾 ci-dessus) si tu veux aussi garder une règle de sélection associée — "
                 "l'onglet 💾 Modèles sauvegardés le permet."
             )
             bf_roi_test_frame = results[idx]["test_frame"]
             bfr1, bfr2 = st.columns(2)
-            bf_roi_n = bfr1.number_input("Nombre de stratégies à tester", min_value=10, max_value=2000,
+            bf_roi_n = bfr1.number_input("Nombre de règles à tester", min_value=10, max_value=2000,
                                          value=300, step=10, key=f"bf_roi_n_{idx}")
             bf_roi_seed = bfr2.number_input("Seed", min_value=0, value=0, key=f"bf_roi_seed_{idx}")
 
@@ -614,18 +806,47 @@ with tab_brute:
                     bf_strat_i = bf_roi_strategies_sorted[bf_ridx]
                     probs = bf_roi_test_frame["model_prob_p1"].values
                     bf_bets_df_i, bf_bt_i = run_backtest(probs, bf_roi_test_frame, bf_strat_i)
-                    st.markdown(f"##### Détail — stratégie #{bf_roi_df.iloc[bf_ridx]['#']}")
+                    st.markdown(f"##### Détail — règle #{bf_roi_df.iloc[bf_ridx]['#']}")
                     render_roi_score(bf_bt_i, key_prefix=f"bf_roi_detail_{idx}_{bf_ridx}")
                     render_backtest_metrics(bf_bt_i)
                     render_equity_curve(bf_bets_df_i, f"bf_roi_{idx}_{bf_ridx}")
-                    with st.expander("Stratégie testée"):
+                    with st.expander("Règle testée"):
                         st.json(bf_strat_i)
+
+                    saved_model_id = st.session_state.get(f"saved_model_id_bf_{idx}")
+                    if saved_model_id is None:
+                        st.info(
+                            "Sauvegarde d'abord le modèle (bouton 💾 ci-dessus) pour pouvoir aussi "
+                            "sauvegarder cette règle de sélection."
+                        )
+                    else:
+                        bf_roi_strat_name = st.text_input(
+                            "Nom de la règle de sélection", value=f"bruteforce_#{bf_roi_df.iloc[bf_ridx]['#']}",
+                            key=f"bf_roi_name_{idx}_{bf_ridx}",
+                        )
+                        if st.button("💾 Sauvegarder cette règle", key=f"bf_roi_save_{idx}_{bf_ridx}"):
+                            bf_rscore_i = compute_roi_score(bf_bt_i)["score"]
+                            store.save_selection_rule(
+                                saved_model_id, bf_roi_strat_name, bf_strat_i, bf_bt_i, bf_rscore_i, bf_bets_df_i
+                            )
+                            st.success("Règle de sélection sauvegardée — visible dans l'onglet 🎯 Stratégies.")
+
+            render_walk_forward_section(
+                results[idx]["algo"], results[idx]["params"], results[idx]["features"], results[idx]["strategy"],
+                key_prefix=f"bf_{idx}", odds_label=bf_odds_label,
+                confirmation_start=bf_settings["confirmation_start"], confirmation_months=bf_settings["confirmation_months"],
+                max_possible=max_possible, wf_dataset=bf_settings["wf_dataset"],
+            )
 
 
 # ----------------------------------------------------------------------
 # Onglet constructeur manuel
 # ----------------------------------------------------------------------
 with tab_manual:
+    man_settings = render_general_settings("man", min_possible, max_possible, available_surfaces)
+    odds_label = man_settings["odds_label"]
+    train_frame, test_frame = man_settings["train_frame"], man_settings["test_frame"]
+
     st.subheader("Construire un modèle sur-mesure")
     if st.session_state.get("_loaded_from_saved_name"):
         st.info(
@@ -687,118 +908,17 @@ with tab_manual:
 
     if st.session_state.get("manual_result"):
         st.divider()
-        render_result_detail(st.session_state["manual_result"], key_prefix="manual", odds_label=odds_label)
+        render_result_detail(
+            st.session_state["manual_result"], key_prefix="manual", odds_label=odds_label,
+            train_start=man_settings["train_start"], train_end=man_settings["train_end"],
+            test_start=man_settings["test_start"], test_end=man_settings["test_end"],
+        )
 
-    st.divider()
-    st.markdown("#### 🔁 Validation glissante (walk-forward)")
-    st.caption(
-        "Réentraîne CETTE configuration (algo/hyperparamètres/features/stratégie ci-dessus) sur plusieurs "
-        "fenêtres temporelles successives (entraînement extensible, test glissant), puis sur la tranche de "
-        "confirmation finale définie plus haut (🔒 Réserve de confirmation finale). Un modèle qui n'est bon "
-        "que sur une seule coupure train/test peut avoir simplement eu de la chance — la stabilité d'AUC/Brier "
-        "sur plusieurs fenêtres est un bien meilleur indicateur de fiabilité qu'un seul run."
+    render_walk_forward_section(
+        algo_key, params, features, strategy, key_prefix="manual", odds_label=odds_label,
+        confirmation_start=man_settings["confirmation_start"], confirmation_months=man_settings["confirmation_months"],
+        max_possible=max_possible, wf_dataset=man_settings["wf_dataset"],
     )
-    wc1, wc2, wc3 = st.columns(3)
-    wf_n_windows = wc1.slider("Nombre de fenêtres", 2, 8, 4, key="wf_n_windows")
-    wf_test_months = wc2.slider("Durée de test par fenêtre (mois)", 1, 12, 6, key="wf_test_months")
-    wf_min_train_months = wc3.slider("Entraînement minimum (mois)", 6, 60, 24, key="wf_min_train")
-    st.caption(
-        f"Confirmation finale : **{confirmation_start} → {max_possible}** (réglée dans "
-        "🔒 Réserve de confirmation finale ci-dessus, en haut de page — la même réserve que celle qui limite "
-        "déjà l'exploration, pour garantir qu'elle est réellement jamais vue avant ce test)."
-    )
-
-    if st.button("🔁 Lancer la validation glissante", key="wf_run_btn"):
-        if not features:
-            st.error("Sélectionne au moins une feature.")
-        else:
-            odds_w, odds_l = ODDS_CHOICES[odds_label]
-            with st.spinner("Validation glissante en cours (plusieurs entraînements successifs)..."):
-                try:
-                    wf_windows, wf_holdout, wf_holdout_bounds = run_walk_forward(
-                        dataset, odds_w, odds_l, algo_key, params, expand_features(features), strategy,
-                        n_windows=wf_n_windows, test_months=wf_test_months,
-                        min_train_months=wf_min_train_months, holdout_months=confirmation_months,
-                    )
-                    st.session_state["wf_result"] = (wf_windows, wf_holdout, wf_holdout_bounds)
-                except ValueError as e:
-                    st.error(str(e))
-                    st.session_state.pop("wf_result", None)
-
-    if st.session_state.get("wf_result"):
-        wf_windows, wf_holdout, wf_holdout_bounds = st.session_state["wf_result"]
-        if not wf_windows:
-            st.warning("Aucune fenêtre exploitable avec ces paramètres (pas assez de matchs avec cotes).")
-        else:
-            wf_rows = []
-            for wr in wf_windows:
-                w, r = wr["window"], wr["result"]
-                m, bt = r["metrics"], r["backtest_metrics"]
-                wf_rows.append({
-                    "Fenêtre test": f"{w['test_start'].date()} → {w['test_end'].date()}",
-                    "n_test": m["n_test"], "AUC": round(m["auc"], 3), "Brier": round(m["brier"], 4),
-                    "LogLoss": round(m["logloss"], 4), "roi_%": round(bt["roi"] * 100, 2),
-                    "n_bets": bt["n_bets"],
-                })
-            wf_df = pd.DataFrame(wf_rows)
-            agg = wf_df[["AUC", "Brier", "LogLoss", "roi_%"]].agg(["mean", "std"]).round(4)
-            st.dataframe(wf_df, width="stretch", hide_index=True)
-            c1, c2 = st.columns(2)
-            c1.metric("AUC moyen (± écart-type)", f"{agg.loc['mean','AUC']:.3f} ± {agg.loc['std','AUC']:.3f}")
-            c2.metric("Brier moyen (± écart-type)", f"{agg.loc['mean','Brier']:.4f} ± {agg.loc['std','Brier']:.4f}")
-            st.caption(
-                f"ROI moyen sur les {len(wf_df)} fenêtres : {agg.loc['mean','roi_%']:.1f}% "
-                f"(écart-type {agg.loc['std','roi_%']:.1f} pts) — une forte variabilité d'une fenêtre à "
-                "l'autre est un signe que le ROI observé n'est pas fiable."
-            )
-
-            st.write("")
-            with st.container(border=True):
-                st.markdown("### 🔒 Confirmation finale — jamais vue pendant la recherche")
-                st.caption(
-                    "Contrairement aux fenêtres ci-dessus (qui font partie du réglage de la config), cette "
-                    "tranche est mise de côté AVANT tout entraînement : c'est le seul résultat qui n'est pas "
-                    "exposé au biais de comparaisons multiples du bruteforce ni au réglage manuel des "
-                    "hyperparamètres. Si un chiffre ici doit faire foi, c'est celui-là."
-                )
-                if wf_holdout is None:
-                    st.warning("Pas assez de données sur la période de confirmation pour l'évaluer.")
-                else:
-                    hm, hbt = wf_holdout["metrics"], wf_holdout["backtest_metrics"]
-                    hq = compute_quality_score(hm, DEFAULT_WEIGHTS)
-                    st.markdown(
-                        f"**Période : {wf_holdout_bounds['test_start'].date()} → "
-                        f"{wf_holdout_bounds['test_end'].date()}**"
-                    )
-                    hc1, hc2, hc3, hc4, hc5, hc6 = st.columns(6)
-                    hc1.metric("🏆 Score qualité", f"{hq['score']:.1f}/100" if hq["score"] == hq["score"] else "n/a")
-                    hc2.metric("AUC", f"{hm['auc']:.3f}")
-                    hc3.metric("Brier", f"{hm['brier']:.4f}")
-                    hc4.metric("Log loss", f"{hm['logloss']:.4f}")
-                    hc5.metric("ROI", f"{hbt['roi']*100:.1f}%")
-                    hc6.metric("Paris placés", f"{hbt['n_bets']}")
-
-                    roi_windows = agg.loc["mean", "roi_%"]
-                    roi_holdout = hbt["roi"] * 100
-                    if hbt["n_bets"] == 0:
-                        st.info("Aucun pari déclenché sur la confirmation finale (seuil d'edge jamais atteint).")
-                    elif (roi_windows >= 0) != (roi_holdout >= 0):
-                        st.warning(
-                            f"⚠️ Le signe du ROI s'inverse entre les fenêtres de recherche ({roi_windows:.1f}%) "
-                            f"et la confirmation finale ({roi_holdout:.1f}%) — signe que le ROI trouvé pendant "
-                            "la recherche ne généralise pas, ne pas faire confiance à cette config sur cette base."
-                        )
-                    elif roi_holdout >= 0:
-                        st.success(
-                            f"✅ ROI toujours positif sur du jamais-vu ({roi_holdout:.1f}%, cohérent avec "
-                            f"{roi_windows:.1f}% en moyenne sur les fenêtres de recherche)."
-                        )
-                    else:
-                        st.warning(
-                            f"ROI négatif sur la confirmation finale ({roi_holdout:.1f}%) — cohérent avec les "
-                            f"fenêtres de recherche ({roi_windows:.1f}%), donc pas de biais de sélection, mais "
-                            "pas non plus de quoi exploiter cette config."
-                        )
 
 
 # ----------------------------------------------------------------------
@@ -922,7 +1042,7 @@ with tab_saved:
                 st.info("Charge d'abord les prédictions du modèle (bouton ci-dessus).")
             else:
                 roi_tab_manual, roi_tab_bf, roi_tab_strats = st.tabs(
-                    ["🎛️ Simulation manuelle", "🎲 Bruteforce ROI", "💾 Stratégies sauvegardées"]
+                    ["🎛️ Simulation manuelle", "🎲 Bruteforce ROI", "💾 Règles de sélection sauvegardées"]
                 )
 
                 # ------------------------------------------------------------
@@ -958,20 +1078,20 @@ with tab_saved:
                         render_equity_curve(bets_df_m, f"roi_man_{row['id']}")
 
                         strat_name = st.text_input(
-                            "Nom de la stratégie", value=f"manuelle_edge{m_edge:.2f}_{m_stake_mode}",
+                            "Nom de la règle de sélection", value=f"manuelle_edge{m_edge:.2f}_{m_stake_mode}",
                             key=f"roi_man_name_{row['id']}",
                         )
-                        if st.button("💾 Sauvegarder cette stratégie", key=f"roi_man_save_{row['id']}"):
+                        if st.button("💾 Sauvegarder cette règle", key=f"roi_man_save_{row['id']}"):
                             rscore = compute_roi_score(bt_m)["score"]
-                            store.save_roi_strategy(row["id"], strat_name, strat_m, bt_m, rscore, bets_df_m)
-                            st.success("Stratégie sauvegardée — visible dans l'onglet 💾 Stratégies sauvegardées.")
+                            store.save_selection_rule(row["id"], strat_name, strat_m, bt_m, rscore, bets_df_m)
+                            st.success("Règle de sélection sauvegardée — visible dans l'onglet 🎯 Stratégies.")
 
                 # ------------------------------------------------------------
                 # Bruteforce ROI
                 # ------------------------------------------------------------
                 with roi_tab_bf:
                     rc1, rc2 = st.columns(2)
-                    roi_n = rc1.number_input("Nombre de stratégies à tester", min_value=10, max_value=2000,
+                    roi_n = rc1.number_input("Nombre de règles à tester", min_value=10, max_value=2000,
                                               value=300, step=10, key=f"roi_bf_n_{row['id']}")
                     roi_seed = rc2.number_input("Seed", min_value=0, value=0, key=f"roi_bf_seed_{row['id']}")
 
@@ -1017,30 +1137,40 @@ with tab_saved:
                             strat_i = roi_strategies_sorted[ridx]
                             probs = roi_test_frame["model_prob_p1"].values
                             bets_df_i, bt_i = run_backtest(probs, roi_test_frame, strat_i)
-                            st.markdown(f"##### Détail — stratégie #{roi_df.iloc[ridx]['#']}")
+                            st.markdown(f"##### Détail — règle #{roi_df.iloc[ridx]['#']}")
                             render_roi_score(bt_i, key_prefix=f"roi_bf_detail_{row['id']}_{ridx}")
                             render_backtest_metrics(bt_i)
                             render_equity_curve(bets_df_i, f"roi_bf_{row['id']}_{ridx}")
 
                             bf_strat_name = st.text_input(
-                                "Nom de la stratégie", value=f"bruteforce_#{roi_df.iloc[ridx]['#']}",
+                                "Nom de la règle de sélection", value=f"bruteforce_#{roi_df.iloc[ridx]['#']}",
                                 key=f"roi_bf_name_{row['id']}_{ridx}",
                             )
-                            if st.button("💾 Sauvegarder cette stratégie", key=f"roi_bf_save_{row['id']}_{ridx}"):
+                            if st.button("💾 Sauvegarder cette règle", key=f"roi_bf_save_{row['id']}_{ridx}"):
                                 rscore_i = compute_roi_score(bt_i)["score"]
-                                store.save_roi_strategy(row["id"], bf_strat_name, strat_i, bt_i, rscore_i, bets_df_i)
-                                st.success("Stratégie sauvegardée — visible dans l'onglet 💾 Stratégies sauvegardées.")
+                                store.save_selection_rule(row["id"], bf_strat_name, strat_i, bt_i, rscore_i, bets_df_i)
+                                st.success("Règle de sélection sauvegardée — visible dans l'onglet 🎯 Stratégies.")
 
                 # ------------------------------------------------------------
-                # Stratégies ROI sauvegardées pour ce modèle
+                # Règles de sélection sauvegardées pour ce modèle
                 # ------------------------------------------------------------
                 with roi_tab_strats:
-                    strats_df = store.list_roi_strategies(row["id"])
+                    strats_df = store.list_selection_rules(row["id"])
                     if strats_df.empty:
-                        st.info("Aucune stratégie ROI sauvegardée pour ce modèle pour l'instant.")
+                        st.info("Aucune règle de sélection sauvegardée pour ce modèle pour l'instant.")
                     else:
+                        strat_params = strats_df["strategy_json"].apply(json.loads)
+                        strats_df = strats_df.assign(
+                            edge_threshold=strat_params.apply(lambda s: s.get("edge_threshold")),
+                            stake_mode=strat_params.apply(lambda s: s.get("stake_mode")),
+                            kelly_fraction=strat_params.apply(
+                                lambda s: s.get("kelly_fraction") if s.get("stake_mode") == "kelly" else None
+                            ),
+                            bankroll=strat_params.apply(lambda s: s.get("bankroll")),
+                        )
                         strat_display_cols = ["id", "name", "roi_score", "roi", "n_bets", "total_profit",
-                                               "win_rate", "max_drawdown", "created_at"]
+                                               "win_rate", "max_drawdown", "edge_threshold", "stake_mode",
+                                               "kelly_fraction", "bankroll", "created_at"]
                         strat_event = st.dataframe(
                             strats_df[strat_display_cols], width="stretch", hide_index=True,
                             on_select="rerun", selection_mode="single-row", key=f"roi_strats_table_{row['id']}",
@@ -1049,12 +1179,170 @@ with tab_saved:
                         if strat_sel:
                             srow = strats_df.iloc[strat_sel[0]]
                             st.markdown(f"##### {srow['name']}")
-                            with st.expander("Stratégie", expanded=True):
+                            with st.expander("Règle de sélection", expanded=True):
                                 st.json(json.loads(srow["strategy_json"]))
-                            strat_bets_df = store.load_roi_strategy_bets(srow["id"])
+
+                            rscore = srow["roi_score"]
+                            st.metric("🎯 Score ROI (règle)", f"{rscore:.1f}/100" if rscore == rscore else "n/a")
+                            render_backtest_metrics(dict(
+                                n_bets=int(srow["n_bets"]), roi=srow["roi"], total_profit=srow["total_profit"],
+                                win_rate=srow["win_rate"], final_bankroll=srow["final_bankroll"],
+                                max_drawdown=srow["max_drawdown"],
+                            ))
+
+                            strat_bets_df = store.load_selection_rule_bets(srow["id"])
                             render_equity_curve(strat_bets_df, f"roi_strat_view_{srow['id']}")
-                            if st.button("🗑️ Supprimer cette stratégie", key=f"del_strat_{srow['id']}"):
-                                confirm_delete_roi_strategy(srow["id"], srow["name"])
+                            if st.button("🗑️ Supprimer cette règle", key=f"del_strat_{srow['id']}"):
+                                confirm_delete_selection_rule(srow["id"], srow["name"])
+
+
+# ----------------------------------------------------------------------
+# Onglet Stratégies
+# ----------------------------------------------------------------------
+with tab_strategies:
+    st.subheader("🎯 Stratégies")
+    st.caption(
+        "Une stratégie = une association que tu crées toi-même entre un modèle sauvegardé et une de "
+        "ses règles de sélection sauvegardées (créées via la simulation manuelle ou le bruteforce ROI, "
+        "onglet 💾 Modèles sauvegardés → 🎯 Optimisation ROI). Cette liste est vide tant que tu n'as "
+        "rien ajouté ci-dessous."
+    )
+
+    strat_models = store.list_models().reset_index(drop=True)
+    if strat_models.empty:
+        st.info(
+            "Aucun modèle sauvegardé pour l'instant — entraîne et sauvegarde un modèle dans l'onglet "
+            "'🛠️ Construire un modèle'."
+        )
+    else:
+        st.markdown("#### ➕ Ajouter une stratégie")
+        new_strat_model_labels = [f"{r['name']} ({r['algo']}, AUC {r['auc']:.3f})" for _, r in strat_models.iterrows()]
+        new_strat_model_idx = st.selectbox(
+            "Modèle", range(len(new_strat_model_labels)), format_func=lambda i: new_strat_model_labels[i],
+            key="new_strat_model_select",
+        )
+        new_strat_model_row = strat_models.iloc[new_strat_model_idx]
+        new_strat_model_id = new_strat_model_row["id"]
+
+        new_strat_rules = store.list_selection_rules(new_strat_model_id).reset_index(drop=True)
+        if new_strat_rules.empty:
+            st.warning(
+                "Ce modèle n'a aucune règle de sélection sauvegardée — crée-en une d'abord dans "
+                "l'onglet '💾 Modèles sauvegardés' → section '🎯 Optimisation ROI pour ce modèle'."
+            )
+        else:
+            new_rule_labels = [
+                f"{r['name']} (ROI {r['roi']*100:.1f}%, {r['n_bets']} paris)" for _, r in new_strat_rules.iterrows()
+            ]
+            new_rule_idx = st.selectbox(
+                "Règle de sélection", range(len(new_rule_labels)), format_func=lambda i: new_rule_labels[i],
+                key="new_strat_rule_select",
+            )
+            new_rule_row = new_strat_rules.iloc[new_rule_idx]
+            new_strat_name = st.text_input(
+                "Nom de la stratégie", value=f"{new_strat_model_row['name']} — {new_rule_row['name']}",
+                key="new_strat_name",
+            )
+            if st.button("➕ Créer la stratégie", key="new_strat_create_btn", type="primary"):
+                store.create_strategy(new_strat_name, new_strat_model_id, new_rule_row["id"])
+                st.success("Stratégie créée.")
+                st.rerun()
+
+        st.divider()
+        st.markdown("#### Mes stratégies")
+        strategies_df = store.list_strategies()
+        if strategies_df.empty:
+            st.info("Aucune stratégie créée pour l'instant — utilise le formulaire ci-dessus.")
+        else:
+            strat_params = strategies_df["strategy_json"].apply(json.loads)
+            strategies_df = strategies_df.assign(
+                edge_threshold=strat_params.apply(lambda s: s.get("edge_threshold")),
+                stake_mode=strat_params.apply(lambda s: s.get("stake_mode")),
+                kelly_fraction=strat_params.apply(
+                    lambda s: s.get("kelly_fraction") if s.get("stake_mode") == "kelly" else None
+                ),
+                bankroll=strat_params.apply(lambda s: s.get("bankroll")),
+            )
+            strat_display_cols = ["name", "model_name", "algo", "auc", "rule_name", "roi_score", "roi",
+                                   "n_bets", "total_profit", "win_rate", "max_drawdown",
+                                   "edge_threshold", "stake_mode", "kelly_fraction", "bankroll", "created_at"]
+            strat_event = st.dataframe(
+                strategies_df[strat_display_cols].rename(columns={
+                    "name": "Stratégie", "model_name": "Modèle", "algo": "Algo", "rule_name": "Règle de sélection",
+                }),
+                width="stretch", hide_index=True,
+                on_select="rerun", selection_mode="single-row", key="strategies_table",
+            )
+            strat_sel = strat_event.selection.rows if strat_event and strat_event.selection else []
+            if strat_sel:
+                srow = strategies_df.iloc[strat_sel[0]]
+                st.divider()
+                st.markdown(f"##### {srow['name']}")
+                with st.expander("Détail", expanded=True):
+                    st.write(f"**Modèle**: {srow['model_name']} ({srow['algo']})")
+                    st.write(f"**Règle de sélection**: {srow['rule_name']}")
+                    st.json(json.loads(srow["strategy_json"]))
+                render_backtest_metrics(dict(
+                    n_bets=int(srow["n_bets"]), roi=srow["roi"], total_profit=srow["total_profit"],
+                    win_rate=srow["win_rate"], final_bankroll=srow["final_bankroll"],
+                    max_drawdown=srow["max_drawdown"],
+                ))
+
+                sc1, sc2, sc3 = st.columns(3)
+                with sc1:
+                    ren_name = st.text_input("Nouveau nom", value=srow["name"], key=f"strat_ren_input_{srow['id']}")
+                    if st.button("✏️ Renommer", key=f"strat_ren_btn_{srow['id']}",
+                                 disabled=(ren_name == srow["name"])):
+                        store.rename_strategy(srow["id"], ren_name)
+                        st.rerun()
+                with sc2:
+                    st.caption("Changer le modèle/la règle")
+                    if st.button("🛠️ Éditer", key=f"strat_edit_open_{srow['id']}"):
+                        st.session_state["strat_editing_id"] = srow["id"]
+                with sc3:
+                    st.caption("Irréversible")
+                    if st.button("🗑️ Supprimer", key=f"strat_del_btn_{srow['id']}"):
+                        store.delete_strategy(srow["id"])
+                        st.rerun()
+
+                if st.session_state.get("strat_editing_id") == srow["id"]:
+                    with st.expander("🛠️ Éditer cette stratégie", expanded=True):
+                        edit_model_labels = [
+                            f"{r['name']} ({r['algo']})" for _, r in strat_models.iterrows()
+                        ]
+                        cur_model_pos = int(strat_models.index[strat_models["id"] == srow["model_id"]][0])
+                        edit_model_idx = st.selectbox(
+                            "Modèle", range(len(edit_model_labels)), index=cur_model_pos,
+                            format_func=lambda i: edit_model_labels[i], key=f"strat_edit_model_{srow['id']}",
+                        )
+                        edit_model_id = strat_models.iloc[edit_model_idx]["id"]
+
+                        edit_rules = store.list_selection_rules(edit_model_id).reset_index(drop=True)
+                        if edit_rules.empty:
+                            st.warning("Ce modèle n'a aucune règle de sélection sauvegardée.")
+                        else:
+                            edit_rule_labels = [
+                                f"{r['name']} (ROI {r['roi']*100:.1f}%, {r['n_bets']} paris)"
+                                for _, r in edit_rules.iterrows()
+                            ]
+                            if edit_model_id == srow["model_id"] and srow["rule_id"] in edit_rules["id"].values:
+                                cur_rule_pos = int(edit_rules.index[edit_rules["id"] == srow["rule_id"]][0])
+                            else:
+                                cur_rule_pos = 0
+                            edit_rule_idx = st.selectbox(
+                                "Règle de sélection", range(len(edit_rule_labels)), index=cur_rule_pos,
+                                format_func=lambda i: edit_rule_labels[i], key=f"strat_edit_rule_{srow['id']}",
+                            )
+                            edit_rule_id = edit_rules.iloc[edit_rule_idx]["id"]
+
+                            ec1, ec2 = st.columns(2)
+                            if ec1.button("💾 Enregistrer", key=f"strat_edit_save_{srow['id']}", type="primary"):
+                                store.update_strategy(srow["id"], edit_model_id, edit_rule_id)
+                                st.session_state.pop("strat_editing_id", None)
+                                st.rerun()
+                            if ec2.button("Annuler", key=f"strat_edit_cancel_{srow['id']}"):
+                                st.session_state.pop("strat_editing_id", None)
+                                st.rerun()
 
 
 # ----------------------------------------------------------------------
@@ -1069,5 +1357,7 @@ with tab_upcoming:
 # ----------------------------------------------------------------------
 with tab_data:
     render_data_management()
+    st.divider()
+    render_review_queue()
     st.divider()
     render_db_explorer()

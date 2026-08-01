@@ -11,7 +11,7 @@ MATCH_COLUMNS = [
     "match_id", "tourney_date", "tourney_name", "surface", "tourney_level", "round", "best_of",
     "winner_name", "winner_hand", "winner_ht", "winner_age", "winner_rank", "winner_rank_points",
     "loser_name", "loser_hand", "loser_ht", "loser_age", "loser_rank", "loser_rank_points",
-    "score", "minutes", "match_confidence",
+    "score", "minutes", "match_confidence", "match_comment",
     "odds_w_b365", "odds_l_b365", "odds_w_ps", "odds_l_ps",
     "odds_w_max", "odds_l_max", "odds_w_avg", "odds_l_avg",
 ]
@@ -36,7 +36,12 @@ def load_matches() -> pd.DataFrame:
     ]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.sort_values("tourney_date").reset_index(drop=True)
+    # kind="stable" (le quicksort par défaut ne l'est pas): tous les matchs
+    # d'un même tournoi partagent la date de début du tournoi, seul l'ordre
+    # des lignes de la base les départage — et il y est déjà chronologique
+    # (tri par tour effectué à la consolidation). Un tri non stable le
+    # détruirait, replaçant potentiellement une finale avant un 1er tour.
+    df = df.sort_values("tourney_date", kind="stable").reset_index(drop=True)
     return df
 
 

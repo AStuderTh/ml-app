@@ -158,6 +158,12 @@ def norm_tourney_id(tid: str) -> str:
 # qu'il s'agit du même événement (même ville/même place dans le calendrier).
 # Clé = nom canonique, valeurs = fragments (après normalisation) qui doivent
 # tous être reconnus comme cet événement.
+#
+# ATTENTION: les marqueurs sont comparés à des noms DÉJÀ normalisés par
+# norm_tourney_name(). Ils doivent donc être écrits sous leur forme
+# normalisée, sinon ils ne matchent jamais: pas de mot-filtre ("hall of
+# fame" -> "hall fame", "of" étant supprimé), pas de ponctuation ("U.S." ->
+# "u s", "men's" -> "mens").
 TOURNEY_ALIASES = {
     "indian wells": ["indian wells", "bnp paribas"],
     "miami": ["miami", "sony ericsson", "nasdaq 100", "lipton"],
@@ -195,7 +201,7 @@ TOURNEY_ALIASES = {
     "barcelona": ["barcelona", "godo", "conde de godo"],
     "munich": ["munich", "bmw open"],
     "eastbourne": ["eastbourne", "devonshire"],
-    "newport": ["newport", "hall of fame"],
+    "newport": ["newport", "hall fame"],
     "atlanta": ["atlanta", "bb t"],
     "los cabos": ["los cabos", "abierto los cabos"],
     "winston salem": ["winston salem"],
@@ -217,21 +223,29 @@ TOURNEY_ALIASES = {
     "kitzbuhel": ["kitzbuhel", "austrian open", "generali open"],
     "cordoba": ["cordoba open"],
     "santiago": ["santiago", "chile open"],
-    "houston": ["houston", "us men s clay"],
+    "houston": ["houston", "u s mens clay", "us mens clay"],
+    "roland garros": ["roland garros", "french open"],
 }
 
 
 def canonicalize_tourney(name_norm: str) -> str:
     """Reconnaît un alias sponsor connu par inclusion de MOTS entiers (pas de
     sous-chaîne brute, pour éviter qu'un marqueur générique ('open') matche
-    à l'intérieur d'un autre mot)."""
+    à l'intérieur d'un autre mot).
+
+    On retient le marqueur le PLUS SPÉCIFIQUE (le plus de mots) parmi tous
+    ceux qui correspondent, et non le premier rencontré: 'bnp paribas
+    masters' (Paris) contient le marqueur 'bnp paribas' d'Indian Wells, et
+    un simple parcours dans l'ordre du dictionnaire renverrait donc Indian
+    Wells — deux tournois distincts confondus."""
     tokens = set(name_norm.split())
+    best_canonical, best_len = None, 0
     for canonical, markers in TOURNEY_ALIASES.items():
         for marker in markers:
             marker_tokens = marker.split()
-            if all(t in tokens for t in marker_tokens):
-                return canonical
-    return name_norm
+            if len(marker_tokens) > best_len and all(t in tokens for t in marker_tokens):
+                best_canonical, best_len = canonical, len(marker_tokens)
+    return best_canonical if best_canonical is not None else name_norm
 
 
 def norm_tourney_name(name: str) -> str:
@@ -276,16 +290,62 @@ TD_ROUND_LABELS_IN_ORDER = [
     "The Final", "Semifinals", "Quarterfinals",
     "4th Round", "3rd Round", "2nd Round", "1st Round",
 ]
-TD_ROUND_RANK = {label: i for i, label in enumerate(TD_ROUND_LABELS_IN_ORDER)}
 TD_ROUND_SPECIAL = {"Round Robin"}
+
+# Tours nommés: leur rang depuis la finale est absolu, il ne dépend pas de la
+# taille du tableau.
+TD_NAMED_ROUND_RANK = {"The Final": 0, "Semifinals": 1, "Quarterfinals": 2}
+# Tours numérotés: leur rang, LUI, dépend de la taille du tableau. Un
+# "1st Round" est un R32 (rang 4) dans un tableau de 32, mais un R128
+# (rang 6) en Grand Chelem. cf. td_numbered_round_rank.
+TD_NUMBERED_ROUNDS = {"1st Round": 1, "2nd Round": 2, "3rd Round": 3, "4th Round": 4}
+
+
+ATP_ROUND_BY_RANK = {0: "F", 1: "SF", 2: "QF", 3: "R16", 4: "R32", 5: "R64", 6: "R128"}
 
 
 def atp_round_rank(round_code: str):
     return ATP_ROUND_RANK.get(str(round_code))
 
 
-def td_round_rank(round_label: str):
-    return TD_ROUND_RANK.get(str(round_label))
+def atp_round_from_rank(rank, is_rr=False):
+    """Code de tour ATP ('R32', 'QF'...) à partir du rang-depuis-la-finale.
+    Sert à réexprimer les libellés tennis-data.co ('1st Round') dans le même
+    vocabulaire que Sackmann/TML: sans ça la colonne `round` de la base
+    finale mélange deux nomenclatures selon l'origine de la ligne, ce qui la
+    rend inutilisable telle quelle comme variable catégorielle."""
+    if is_rr:
+        return "RR"
+    if rank is None or (isinstance(rank, float) and rank != rank):
+        return None
+    return ATP_ROUND_BY_RANK.get(int(rank))
+
+
+def td_numbered_round_rank(round_label: str, n_numbered_rounds: int):
+    """Rang-depuis-la-finale d'un tour numéroté tennis-data.co, connaissant le
+    nombre de tours numérotés de CETTE instance de tournoi.
+
+    tennis-data.co ne publie pas la taille du tableau et numérote les tours
+    depuis le début ("1st Round"), alors que Sackmann/TML les nomment depuis
+    la fin ("R32"). La conversion dépend donc du tournoi: un tableau de 32 a
+    2 tours numérotés (1st=R32, 2nd=R16), un Grand Chelem en a 4 (1st=R128
+    ... 4th=R16). Comme les 3 derniers tours sont toujours QF/SF/F (rangs
+    2/1/0), le dernier tour numéroté vaut rang 3 et on remonte de là.
+    """
+    n = TD_NUMBERED_ROUNDS.get(str(round_label))
+    if n is None:
+        return None
+    return n_numbered_rounds - n + 3
+
+
+def td_round_rank(round_label: str, n_numbered_rounds: int = 4):
+    """Rang-depuis-la-finale d'un tour tennis-data.co. `n_numbered_rounds`
+    par défaut à 4 (Grand Chelem) uniquement pour rester utilisable hors
+    contexte de tournoi; les loaders passent la vraie valeur par instance."""
+    label = str(round_label)
+    if label in TD_NAMED_ROUND_RANK:
+        return TD_NAMED_ROUND_RANK[label]
+    return td_numbered_round_rank(label, n_numbered_rounds)
 
 
 def is_special_round(round_code: str) -> bool:

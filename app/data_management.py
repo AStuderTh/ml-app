@@ -13,6 +13,7 @@ import streamlit as st
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data")
 DB_PATH = os.path.join(DATA_DIR, "tennis.db")
+REVIEW_CSV_PATH = os.path.join(DATA_DIR, "match_review.csv")
 
 SOURCE_LABELS = {
     "sackmann": "tennis_atp (Sackmann, git)",
@@ -61,6 +62,14 @@ def get_db_stats():
         return None
     con = sqlite3.connect(DB_PATH)
     try:
+        has_matches = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='matches'"
+        ).fetchone()
+        if not has_matches:
+            # fichier présent mais vide/sans schéma (ex: recréé automatiquement par un
+            # sqlite3.connect() après suppression manuelle de tennis.db) — traité comme
+            # absent, pour laisser l'utilisateur relancer une mise à jour depuis zéro.
+            return None
         total = con.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
         max_date = con.execute("SELECT MAX(tourney_date) FROM matches").fetchone()[0]
         by_source = pd.read_sql(
@@ -147,13 +156,179 @@ def render_data_management():
                    f", dernier match : {summary['max_date']}.")
         if summary.get("n_review_pending"):
             st.info(
-                f"{summary['n_review_pending']} cas ambigus à valider manuellement dans "
-                f"data/match_review.csv (colonne `decision`: `merge` ou `reject`), "
-                f"puis relance la mise à jour."
+                f"{summary['n_review_pending']} cas ambigus à valider — utilise la section "
+                f"« Cas ambigus à valider » ci-dessous, puis relance la consolidation."
             )
 
         st.cache_data.clear()
         if st.button("Rafraîchir la page"):
+            st.rerun()
+
+
+def _load_review_df():
+    if not os.path.exists(REVIEW_CSV_PATH):
+        return None
+    df = pd.read_csv(REVIEW_CSV_PATH, dtype=str, keep_default_na=False)
+    df["decision"] = df["decision"].fillna("").astype(str).str.strip().str.lower()
+    df.loc[~df["decision"].isin(["merge", "reject"]), "decision"] = ""
+    return df
+
+
+def _save_review_decisions(decisions_by_id: dict) -> int:
+    """Réécrit data/match_review.csv en appliquant `decisions_by_id`
+    ({review_id: "" | "merge" | "reject"}) par-dessus le fichier tel qu'il
+    est actuellement sur disque, sans toucher aux autres lignes (celles pas
+    affichées dans la page courante gardent leur décision existante)."""
+    from scripts.consolidate.review_io import REVIEW_COLUMNS
+
+    df = pd.read_csv(REVIEW_CSV_PATH, dtype=str, keep_default_na=False)
+    df = df.set_index("review_id", drop=False)
+    n_changed = 0
+    for rid, dec in decisions_by_id.items():
+        if rid not in df.index:
+            continue
+        prev = str(df.at[rid, "decision"]).strip().lower()
+        if prev != dec:
+            df.at[rid, "decision"] = dec
+            n_changed += 1
+    df = df.reset_index(drop=True)[REVIEW_COLUMNS]
+    df.to_csv(REVIEW_CSV_PATH, index=False, encoding="utf-8-sig")
+    return n_changed
+
+
+def render_review_queue():
+    """Interface de validation manuelle des cas ambigus de la consolidation
+    (data/match_review.csv), pour éviter d'avoir à éditer le CSV à la main."""
+    st.subheader("🧩 Cas ambigus à valider")
+
+    df = _load_review_df()
+    if df is None or df.empty:
+        st.caption("Aucun cas ambigu en attente (data/match_review.csv absent ou vide).")
+        return
+
+    n_pending = int((df["decision"] == "").sum())
+    n_merge = int((df["decision"] == "merge").sum())
+    n_reject = int((df["decision"] == "reject").sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("⏳ En attente", n_pending)
+    c2.metric("✅ Fusionnés (merge)", n_merge)
+    c3.metric("❌ Rejetés (reject)", n_reject)
+
+    if n_pending == 0:
+        st.success("Tous les cas ont été tranchés — relance la consolidation ci-dessous pour appliquer les décisions.")
+
+    stages = sorted(df["stage"].dropna().unique().tolist())
+    fc1, fc2, fc3 = st.columns([2, 2, 3])
+    stage_filter = fc1.selectbox("Étape", ["Toutes"] + stages, key="review_stage_filter")
+    status_filter = fc2.selectbox(
+        "Statut", ["En attente", "Tous", "merge", "reject"], key="review_status_filter",
+    )
+    search = fc3.text_input("Recherche (joueur ou tournoi)", key="review_search")
+
+    view = df
+    if stage_filter != "Toutes":
+        view = view[view["stage"] == stage_filter]
+    if status_filter == "En attente":
+        view = view[view["decision"] == ""]
+    elif status_filter != "Tous":
+        view = view[view["decision"] == status_filter]
+    if search:
+        s = search.strip().lower()
+        text_cols = ["a_tourney", "a_winner", "a_loser", "b_tourney", "b_winner", "b_loser"]
+        mask = pd.Series(False, index=view.index)
+        for c in text_cols:
+            mask = mask | view[c].astype(str).str.lower().str.contains(s, na=False, regex=False)
+        view = view[mask]
+
+    st.caption(f"{len(view)} cas correspondent aux filtres (sur {len(df)} au total).")
+    if view.empty:
+        return
+
+    page_size = st.slider("Cas affichés à la fois", 10, 300, 50, step=10, key="review_page_size")
+    view = view.head(page_size)
+
+    display_cols = [
+        "review_id", "decision", "stage", "reason", "score",
+        "a_source", "a_tourney", "a_date", "a_round", "a_winner", "a_loser", "a_score",
+        "b_source", "b_tourney", "b_date", "b_round", "b_winner", "b_loser", "b_score",
+    ]
+    edited = st.data_editor(
+        view[display_cols],
+        hide_index=True,
+        width="stretch",
+        key="review_editor",
+        disabled=[c for c in display_cols if c != "decision"],
+        column_config={
+            "review_id": st.column_config.TextColumn("id", width="small"),
+            "decision": st.column_config.SelectboxColumn(
+                "Décision", options=["", "merge", "reject"], required=False, width="small",
+            ),
+            "stage": st.column_config.TextColumn("Étape", width="small"),
+            "reason": st.column_config.TextColumn("Raison", width="small"),
+            "score": st.column_config.NumberColumn("Similarité", format="%.2f", width="small"),
+            "a_source": st.column_config.TextColumn("A: source"),
+            "a_tourney": st.column_config.TextColumn("A: tournoi"),
+            "a_date": st.column_config.TextColumn("A: date"),
+            "a_round": st.column_config.TextColumn("A: tour"),
+            "a_winner": st.column_config.TextColumn("A: vainqueur"),
+            "a_loser": st.column_config.TextColumn("A: perdant"),
+            "a_score": st.column_config.TextColumn("A: score"),
+            "b_source": st.column_config.TextColumn("B: source"),
+            "b_tourney": st.column_config.TextColumn("B: tournoi"),
+            "b_date": st.column_config.TextColumn("B: date"),
+            "b_round": st.column_config.TextColumn("B: tour"),
+            "b_winner": st.column_config.TextColumn("B: vainqueur"),
+            "b_loser": st.column_config.TextColumn("B: perdant"),
+            "b_score": st.column_config.TextColumn("B: score"),
+        },
+    )
+    st.caption(
+        "`merge` = même match (les deux lignes seront fusionnées) · `reject` = matchs "
+        "différents (gardés séparés) · vide = pas encore tranché."
+    )
+
+    original_by_id = view.set_index("review_id")["decision"]
+    changed = {
+        row["review_id"]: row["decision"]
+        for _, row in edited.iterrows()
+        if row["decision"] != original_by_id.loc[row["review_id"]]
+    }
+
+    if st.button(
+        "💾 Enregistrer les décisions", type="primary", key="review_save_btn", disabled=not changed,
+    ):
+        n = _save_review_decisions(changed)
+        st.success(f"{n} décision(s) enregistrée(s) dans data/match_review.csv.")
+        st.rerun()
+
+    with st.expander("Relancer seulement la consolidation (rapide, sans re-télécharger les sources)"):
+        st.caption(
+            "Applique les décisions enregistrées ci-dessus en refusionnant les données déjà "
+            "présentes sur disque, sans repasser par git pull / téléchargement tennis-data.co."
+        )
+        if st.button("🔁 Relancer la consolidation", key="review_reconsolidate_btn"):
+            log_lines = []
+            log_box = st.empty()
+
+            def on_log(msg):
+                log_lines.append(msg)
+                log_box.code("\n".join(log_lines[-200:]))
+
+            with st.spinner("Consolidation en cours..."):
+                from scripts.consolidate.pipeline import run as run_consolidation
+                stream = _StreamToCallback(on_log)
+                try:
+                    with contextlib.redirect_stdout(stream):
+                        matches_df, review_df = run_consolidation(
+                            DATA_DIR, REVIEW_CSV_PATH, DB_PATH, verbose=True,
+                        )
+                except Exception as e:
+                    st.error(f"Échec de la consolidation : {e}")
+                    st.exception(e)
+                    return
+
+            st.success(f"Consolidation terminée — {len(matches_df):,} matchs en base.".replace(",", " "))
+            st.cache_data.clear()
             st.rerun()
 
 
@@ -174,6 +349,9 @@ def render_db_explorer():
         tables = pd.read_sql(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name", con
         )["name"].tolist()
+        if not tables:
+            st.info("data/tennis.db est vide (aucune table) — lance d'abord une mise à jour ci-dessus.")
+            return
         table = st.selectbox("Table", tables, key="explorer_table")
 
         col_info = pd.read_sql(f"PRAGMA table_info('{table}')", con)

@@ -5,6 +5,8 @@ import hashlib
 import numpy as np
 import pandas as pd
 
+from . import normalize as nm
+
 CONF_RANK = {"high": 4, "manual_confirmed": 4, "medium": 3, "single_source": 2, "pending_review": 1}
 
 FINAL_COLUMNS = [
@@ -76,8 +78,12 @@ def row_from_td_only(td_row, confidence="single_source", review_id=None):
     r["surface"] = td_row.get("Surface")
     r["court"] = td_row.get("Court")
     r["series"] = td_row.get("Series")
-    r["round"] = td_row.get("Round")
+    # réexprimé dans la nomenclature Sackmann/TML ('1st Round' -> 'R32'),
+    # pour que la colonne `round` reste homogène quelle que soit l'origine
+    # de la ligne.
+    r["round"] = nm.atp_round_from_rank(td_row.get("round_rank"), td_row.get("is_rr", False))
     r["best_of"] = td_row.get("Best of")
+    r["score"] = td_row.get("score")
     r["winner_name"] = td_row.get("Winner")
     r["winner_rank"] = td_row.get("WRank")
     r["winner_rank_points"] = td_row.get("WPts")
