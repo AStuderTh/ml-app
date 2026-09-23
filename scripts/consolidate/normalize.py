@@ -2,8 +2,10 @@
 noms de tournois, rounds, tourney_id. Toute la logique de "comment comparer
 deux enregistrements qui ne se ressemblent pas exactement" vit ici.
 """
+import difflib
 import re
 import unicodedata
+from functools import lru_cache
 
 PARTICLES = {"de", "del", "della", "da", "van", "von", "der", "den", "dos",
              "di", "le", "la", "bin", "al", "st", "mac", "mc", "o"}
@@ -76,6 +78,11 @@ def surname_candidates(full_name_norm: str):
     return list(cands)
 
 
+# Fonctions pures appelées des millions de fois par l'appariement (chaque
+# couple de joueurs d'un même tour est confronté, et les mêmes joueurs
+# reviennent tournoi après tournoi). Sans mémoïsation, difflib domine le temps
+# d'exécution de toute la consolidation.
+@lru_cache(maxsize=1 << 18)
 def best_surname_score(name_a_norm: str, name_b_norm: str) -> float:
     """Meilleur score de compatibilité entre 2 noms complets normalisés, en
     essayant toutes les hypothèses de longueur de nom de famille des deux
@@ -113,6 +120,7 @@ def parse_abbrev_name(name: str):
     return surname, initials
 
 
+@lru_cache(maxsize=1 << 18)
 def names_compatible(surname_a: str, surname_b: str, fuzzy: bool = True) -> float:
     """Score [0,1] de compatibilité entre deux noms de famille normalisés,
     tolérant les troncatures de noms composés (ex: 'ramos' vs 'ramos vinolas')."""
@@ -128,7 +136,6 @@ def names_compatible(surname_a: str, surname_b: str, fuzzy: bool = True) -> floa
         return 0.85
     if not fuzzy:
         return 0.0
-    import difflib
     return difflib.SequenceMatcher(None, surname_a, surname_b).ratio()
 
 
@@ -164,16 +171,36 @@ def norm_tourney_id(tid: str) -> str:
 # normalisée, sinon ils ne matchent jamais: pas de mot-filtre ("hall of
 # fame" -> "hall fame", "of" étant supprimé), pas de ponctuation ("U.S." ->
 # "u s", "men's" -> "mens").
+# PIÈGE: un marqueur court peut être inclus dans le nom d'un AUTRE tournoi.
+# Trois cas mesurés dans les données ont été corrigés ici, et la règle du
+# marqueur le plus long (cf. canonicalize_tourney) est ce qui les départage —
+# tout nouveau marqueur générique doit donc être accompagné de sa variante
+# longue concurrente, sinon il capture le mauvais tournoi:
+#   'bnp paribas'       = Paris-Bercy, mais 'bnp paribas open'   = Indian Wells
+#   'mercedes cup'      = Stuttgart,   mais 'mercedes benz cup'  = Los Angeles
+#   'internazionali'    = trop vague : Rome, Palerme ET Milan le portent
+#   'heineken open'     = Auckland,   mais 'heineken open shanghai' = Shanghai
 TOURNEY_ALIASES = {
-    "indian wells": ["indian wells", "bnp paribas"],
+    "indian wells": ["indian wells", "bnp paribas open", "pacific life open"],
     "miami": ["miami", "sony ericsson", "nasdaq 100", "lipton"],
     "cincinnati": ["cincinnati", "western southern", "western south"],
     "basel": ["basel", "swiss indoors"],
-    "paris masters": ["paris masters", "rolex paris masters", "bnp paribas masters", "bercy"],
+    "paris masters": ["paris masters", "rolex paris masters", "bnp paribas",
+                      "bnp paribas masters", "bercy"],
     "vienna": ["vienna", "erste bank"],
     "shanghai masters": ["shanghai masters", "shanghai rolex masters"],
+    # l'étape ATP de Shanghai d'avant l'ère Masters (2000): son nom commercial
+    # contient 'heineken open', marqueur d'Auckland — c'est la variante longue
+    # qui doit gagner.
+    "shanghai": ["shanghai", "heineken open shanghai"],
+    "palermo": ["palermo", "sicilia"],
+    "milan": ["milan", "lombardia"],
+    "s hertogenbosch": ["s hertogenbosch", "rosmalen", "heineken trophy",
+                        "ordina open", "topshelf open", "ricoh open", "libema open"],
+    "los angeles": ["los angeles", "mercedes benz cup"],
     "madrid masters": ["madrid masters", "mutua madrid", "madrid open"],
-    "rome masters": ["rome masters", "internazionali", "italian open", "foro italico", "italia"],
+    "rome masters": ["rome masters", "internazionali bnl", "italian open",
+                     "foro italico", "telecom italia roma"],
     "monte carlo masters": ["monte carlo"],
     "canada masters": ["canada masters", "rogers cup", "canadian open", "national bank open"],
     "queens club": ["queens club", "fever tree", "cinch championships", "stella artois", "aegon championships"],
@@ -184,11 +211,11 @@ TOURNEY_ALIASES = {
     "washington": ["washington", "citi open", "legg mason"],
     "beijing": ["beijing", "china open"],
     "tokyo": ["tokyo", "japan open", "rakuten"],
-    "auckland": ["auckland", "asb classic"],
-    # NB: "Heineken Open"/"Heineken Trophy" volontairement PAS mis en alias
-    # d'Auckland: ce sponsoring a aussi été utilisé pour d'autres étapes du
-    # circuit (ex. Shanghai), un marqueur seulement basé sur le sponsor
-    # créerait un faux rapprochement entre 2 villes différentes.
+    # "heineken open" est bien Auckland (2000-2015), mais le sponsor a aussi
+    # nommé Shanghai 2000 ("heineken open shanghai") et Rosmalen ("heineken
+    # trophy"): ces deux-là sont captés plus haut par des marqueurs plus longs
+    # ou distincts, ce qui rend celui-ci sûr.
+    "auckland": ["auckland", "asb classic", "heineken open"],
     "sydney": ["sydney"],
     "brisbane": ["brisbane"],
     "adelaide": ["adelaide"],
@@ -216,7 +243,6 @@ TOURNEY_ALIASES = {
     "delray beach": ["delray beach"],
     "memphis": ["memphis", "us national indoor"],
     "san jose": ["san jose"],
-    "los angeles": ["los angeles"],
     "bastad": ["bastad", "swedish open"],
     "gstaad": ["gstaad", "swiss open"],
     "umag": ["umag", "croatia open"],
@@ -228,6 +254,7 @@ TOURNEY_ALIASES = {
 }
 
 
+@lru_cache(maxsize=1 << 16)
 def canonicalize_tourney(name_norm: str) -> str:
     """Reconnaît un alias sponsor connu par inclusion de MOTS entiers (pas de
     sous-chaîne brute, pour éviter qu'un marqueur générique ('open') matche
@@ -248,6 +275,7 @@ def canonicalize_tourney(name_norm: str) -> str:
     return best_canonical if best_canonical is not None else name_norm
 
 
+@lru_cache(maxsize=1 << 16)
 def norm_tourney_name(name: str) -> str:
     if name is None:
         return ""
@@ -258,6 +286,7 @@ def norm_tourney_name(name: str) -> str:
     return " ".join(tokens)
 
 
+@lru_cache(maxsize=1 << 18)
 def tourney_name_similarity(a: str, b: str) -> float:
     """Similarité conservatrice: exige un bon accord à la fois au niveau des
     mots (Jaccard) et des caractères (ratio), pour éviter qu'un nom compris
@@ -273,7 +302,6 @@ def tourney_name_similarity(a: str, b: str) -> float:
         return 0.95
     ta, tb = set(na.split()), set(nb.split())
     jaccard = len(ta & tb) / len(ta | tb) if (ta | tb) else 0.0
-    import difflib
     ratio = difflib.SequenceMatcher(None, na, nb).ratio()
     return min(jaccard, ratio)
 

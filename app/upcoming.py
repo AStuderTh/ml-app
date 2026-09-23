@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from app import odds_log, store
+from app import bet_log, odds_log, store
 from app.backtest import DEFAULT_STRATEGY
 from app.live_match import (
     FEATURE_LABELS, build_live_features, compute_current_player_state,
@@ -41,27 +41,44 @@ def _fetch_week(date: dt.date) -> dict:
     resp = requests.get(
         ESPN_SCOREBOARD_URL,
         params={"dates": date.strftime("%Y%m%d")},
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.espn.com/",
+            "Origin": "https://www.espn.com",
+        },
         timeout=20,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-@st.cache_data(ttl=1800, show_spinner="Récupération du calendrier ATP (ESPN)...")
+@st.cache_data(ttl=300, show_spinner="Récupération du calendrier ATP (ESPN)...")
 def get_upcoming_matches(days_ahead: int = 21) -> pd.DataFrame:
-    """Interroge le scoreboard ESPN tous les 3 jours sur la fenêtre demandée
-    (chaque requête renvoie toute la semaine de tournoi active à cette date;
-    un pas de 3 jours garantit qu'aucune semaine de tournoi, qui dure ~7-9
-    jours, ne soit sautée entre deux requêtes) et retourne les matchs simples
-    pas encore joués (status 'pre'), dédupliqués par id de match ESPN."""
+    """Interroge le scoreboard ESPN une fois par semaine sur la fenêtre demandée.
+
+    Chaque réponse renvoie les événements actifs autour de la date demandée;
+    un pas de 7 jours couvre les tournois hebdomadaires tout en évitant de
+    déclencher les limites de requêtes d'ESPN. Les matchs simples pas encore
+    joués (status 'pre') sont dédupliqués par id ESPN.
+    """
     today = dt.date.today()
     rows = {}
-    for offset in range(0, days_ahead + 1, 3):
+    errors = []
+    successful_fetches = 0
+    for offset in range(0, days_ahead + 1, 7):
+        date = today + dt.timedelta(days=offset)
         try:
-            data = _fetch_week(today + dt.timedelta(days=offset))
-        except Exception:
+            data = _fetch_week(date)
+        except Exception as exc:
+            errors.append(f"{date.isoformat()}: {exc}")
             continue
+        successful_fetches += 1
         for event in data.get("events", []):
             tourney_name = event.get("name")
             for grouping in event.get("groupings", []):
@@ -87,29 +104,45 @@ def get_upcoming_matches(days_ahead: int = 21) -> pd.DataFrame:
 
     cols = ["tournoi", "date_utc", "round", "joueur_1", "joueur_2", "lieu"]
     if not rows:
-        return pd.DataFrame(columns=cols)
+        empty = pd.DataFrame(columns=cols)
+        empty.attrs["fetch_errors"] = errors
+        empty.attrs["successful_fetches"] = successful_fetches
+        return empty
 
     df = pd.DataFrame(rows.values())
     df["date_utc"] = pd.to_datetime(df["date_utc"], utc=True)
     df["date_locale"] = df["date_utc"].dt.tz_convert(DISPLAY_TZ)
-    return df.sort_values("date_utc").reset_index(drop=True)
+    df = df.sort_values("date_utc").reset_index(drop=True)
+    df.attrs["fetch_errors"] = errors
+    df.attrs["successful_fetches"] = successful_fetches
+    return df
 
 
 @st.cache_data(show_spinner=False)
-def _guess_surface(tourney_name: str, dataset: pd.DataFrame) -> str:
-    """Devine la surface d'un tournoi à venir en cherchant la surface du
-    match le plus récent joué sous un nom de tournoi équivalent dans
-    l'historique (gère les changements de sponsor via canonicalize_tourney)."""
+def _guess_tourney_context(tourney_name: str, dataset: pd.DataFrame) -> dict:
+    """Devine surface/best_of/indoor d'un tournoi à venir en cherchant les
+    valeurs du match le plus récent joué sous un nom de tournoi équivalent
+    dans l'historique (gère les changements de sponsor via
+    canonicalize_tourney). best_of/indoor alimentent les features
+    best_of_5/is_indoor de app.features en direct (cf. live_match.build_live_features)."""
     from scripts.consolidate.normalize import canonicalize_tourney, norm_tourney_name
 
     target = canonicalize_tourney(norm_tourney_name(tourney_name))
     hist_names = dataset["tourney_name"].dropna().unique()
     matching = [n for n in hist_names if canonicalize_tourney(norm_tourney_name(n)) == target]
     if not matching:
-        return "Hard"
+        return {"surface": "Hard", "best_of": None, "indoor": None}
     sub = dataset[dataset["tourney_name"].isin(matching)].sort_values("tourney_date")
-    surf = sub["surface"].dropna()
-    return surf.iloc[-1] if not surf.empty else "Hard"
+
+    def _last_known(col):
+        s = sub[col].dropna()
+        return s.iloc[-1] if not s.empty else None
+
+    return {
+        "surface": _last_known("surface") or "Hard",
+        "best_of": _last_known("best_of"),
+        "indoor": _last_known("indoor"),
+    }
 
 
 def _implied_prob_from_row(row) -> float | None:
@@ -252,7 +285,7 @@ def _style_signals(display: pd.DataFrame, sides: pd.Series):
     return display.style.apply(lambda _: css, axis=None)
 
 
-def _attach_model_predictions(sub: pd.DataFrame, model_row, state: dict) -> pd.DataFrame:
+def _attach_model_predictions(sub: pd.DataFrame, model_row, state: dict, tourney_ctx: dict = None) -> pd.DataFrame:
     """Ajoute model_prob_j1/model_prob_j2 (probabilité de victoire prédite
     par le modèle sauvegardé sélectionné au-dessus du tableau) à chaque
     ligne de `sub`, en réutilisant l'état courant des joueurs déjà calculé
@@ -269,6 +302,7 @@ def _attach_model_predictions(sub: pd.DataFrame, model_row, state: dict) -> pd.D
     if model is None:
         return sub
     features = json.loads(model_row["features_json"])
+    tourney_ctx = tourney_ctx or {}
 
     for i, row in sub.iterrows():
         if row["joueur_1"] == "TBD" or row["joueur_2"] == "TBD":
@@ -281,7 +315,10 @@ def _attach_model_predictions(sub: pd.DataFrame, model_row, state: dict) -> pd.D
         snap1 = player_snapshot(state, canon1, surface)
         snap2 = player_snapshot(state, canon2, surface)
         implied_prob_p1 = _implied_prob_from_row(row)
-        values, missing = build_live_features(snap1, snap2, state, canon1, canon2, features, surface, implied_prob_p1)
+        values, missing = build_live_features(
+            snap1, snap2, state, canon1, canon2, features, surface, implied_prob_p1,
+            best_of=tourney_ctx.get("best_of"), indoor=tourney_ctx.get("indoor"),
+        )
         if missing:
             continue
         X = pd.DataFrame([values])[features].values
@@ -352,7 +389,8 @@ def _render_match_detail(match: dict, dataset: pd.DataFrame, model_row=None,
         st.warning(f"'{missing}' introuvable dans l'historique de data/tennis.db — pas de stats possibles.")
         return
 
-    surface = match.get("surface") or _guess_surface(match["tournoi"], dataset)
+    tourney_ctx = _guess_tourney_context(match["tournoi"], dataset)
+    surface = match.get("surface") or tourney_ctx["surface"]
     snap1 = player_snapshot(state, canon1, surface)
     snap2 = player_snapshot(state, canon2, surface)
 
@@ -428,7 +466,10 @@ def _render_match_detail(match: dict, dataset: pd.DataFrame, model_row=None,
             implied_prob_p1 = comparison[0]["p1"]
 
         features = json.loads(model_row["features_json"])
-        values, missing = build_live_features(snap1, snap2, state, canon1, canon2, features, surface, implied_prob_p1)
+        values, missing = build_live_features(
+            snap1, snap2, state, canon1, canon2, features, surface, implied_prob_p1,
+            best_of=tourney_ctx["best_of"], indoor=tourney_ctx["indoor"],
+        )
 
         with st.expander("Détail des features utilisées par ce modèle"):
             feat_df = pd.DataFrame([
@@ -483,6 +524,53 @@ def _render_match_detail(match: dict, dataset: pd.DataFrame, model_row=None,
         st.caption(f"Écart du modèle sur la probabilité de victoire de {match['joueur_1']} — {edges}")
 
 
+def _update_all_strategies_signals(df: pd.DataFrame, dataset: pd.DataFrame, tournois: list) -> tuple[int, int]:
+    """Rejoue le pipeline de signal (prédiction modèle + règle de sélection) pour
+    CHAQUE stratégie enregistrée — pas seulement celle choisie dans le menu
+    déroulant au-dessus du tableau — et journalise les nouveaux paris (cf.
+    app.bet_log.record_signals). Permet de tenir à jour l'historique de toutes
+    les stratégies en un clic plutôt que de les sélectionner une par une.
+
+    `df` doit déjà porter les colonnes de cotes (Polymarket + bookmaker choisi),
+    comme le `df` de render_upcoming au moment de l'affichage. Les prédictions
+    du modèle sont mise en cache par (model_id, tournoi) pour éviter de les
+    recalculer plusieurs fois quand deux stratégies partagent le même modèle.
+
+    Retourne (nombre de stratégies exploitables, nombre de paris ajoutés)."""
+    strategies_df = store.list_strategies()
+    if strategies_df.empty or df.empty or dataset is None:
+        return 0, 0
+    saved_models = store.list_models()
+    state = compute_current_player_state(dataset)
+
+    predictions_cache = {}  # (model_id, tourney) -> sub avec model_prob_j1/j2
+    n_strategies, n_bets_logged = 0, 0
+    for _, strat_row in strategies_df.iterrows():
+        model_matches = saved_models[saved_models["id"] == strat_row["model_id"]]
+        if model_matches.empty:
+            continue
+        model_row = model_matches.iloc[0]
+        if not store.artifact_exists(model_row):
+            continue
+        strategy = json.loads(strat_row["strategy_json"])
+        n_strategies += 1
+
+        for tourney in tournois:
+            sub = df[df["tournoi"] == tourney].reset_index(drop=True)
+            if sub.empty:
+                continue
+            cache_key = (model_row["id"], tourney)
+            if cache_key not in predictions_cache:
+                tourney_ctx = _guess_tourney_context(tourney, dataset)
+                sub_ctx = sub.copy()
+                sub_ctx["surface"] = tourney_ctx.get("surface")
+                predictions_cache[cache_key] = _attach_model_predictions(sub_ctx, model_row, state, tourney_ctx)
+            sub_signals = _attach_bet_signals(predictions_cache[cache_key], strategy)
+            n_bets_logged += bet_log.record_signals(sub_signals, strat_row["id"], strat_row["name"], strategy)
+
+    return n_strategies, n_bets_logged
+
+
 def render_upcoming(dataset: pd.DataFrame = None):
     st.subheader("📅 Prochains matchs (ATP)")
     st.caption(
@@ -508,7 +596,15 @@ def render_upcoming(dataset: pd.DataFrame = None):
 
     df = get_upcoming_matches(days_ahead)
     if df.empty:
-        st.info("Aucun match à venir trouvé (tournois ATP en pause, ou API indisponible).")
+        errors = df.attrs.get("fetch_errors", [])
+        successful_fetches = df.attrs.get("successful_fetches", 0)
+        if errors and not successful_fetches:
+            st.warning(
+                "Impossible de récupérer le calendrier ESPN pour la fenêtre demandée. "
+                f"Dernière erreur : {errors[-1]}"
+            )
+        else:
+            st.info("Aucun match à venir trouvé (tournois ATP en pause, ou API indisponible).")
         return
 
     if hide_tbd:
@@ -572,7 +668,7 @@ def render_upcoming(dataset: pd.DataFrame = None):
     st.markdown("#### 🎯 Stratégie / modèle appliqué aux matchs à venir")
     saved_models = store.list_models()
     strategies_df = store.list_strategies()
-    model_row, strategy, strategy_name = None, None, None
+    model_row, strategy, strategy_name, strategy_id = None, None, None, None
 
     if saved_models.empty:
         st.caption(
@@ -602,6 +698,7 @@ def render_upcoming(dataset: pd.DataFrame = None):
             model_row = saved_models[saved_models["id"] == chosen["model_id"]].iloc[0]
             strategy = json.loads(chosen["strategy_json"])
             strategy_name = chosen["name"]
+            strategy_id = chosen["id"]
         else:
             model_row = chosen
 
@@ -621,6 +718,41 @@ def render_upcoming(dataset: pd.DataFrame = None):
                 "(pas de marge bookmaker). Miser plus haut sur un pari déjà décidé ne peut qu'améliorer "
                 "le résultat : le ROI du backtest reste un plancher."
             )
+
+        if not strategies_df.empty:
+            if st.button(
+                "🔄 Mettre à jour les paris (signaux) pour toutes les stratégies",
+                key="upc_update_all_strategies",
+                help="Rejoue le pipeline de signal pour CHAQUE stratégie enregistrée (pas "
+                     "seulement celle sélectionnée ci-dessus) sur les tournois affichés, et "
+                     "journalise les nouveaux paris — sans avoir à les sélectionner une par une.",
+            ):
+                with st.spinner("Recalcul des signaux pour toutes les stratégies..."):
+                    n_strat, n_added = _update_all_strategies_signals(df, dataset, tournois)
+                if n_strat == 0:
+                    st.warning(
+                        "Aucune stratégie exploitable : soit aucun modèle associé n'est "
+                        "retrouvable sur le disque, soit `data/tennis.db` est indisponible."
+                    )
+                else:
+                    st.success(
+                        f"✅ {n_strat} stratégie(s) rejouée(s) sur {len(tournois)} tournoi(s) — "
+                        f"{n_added} nouveau(x) pari(s) enregistré(s) au journal."
+                    )
+
+    # Un modèle dont le .joblib a disparu ne produirait aucune prédiction, en
+    # silence: le tableau s'afficherait avec des probabilités vides, sans que
+    # rien n'indique pourquoi. On le signale explicitement plutôt que de laisser
+    # l'utilisateur croire à un modèle sans opinion.
+    if model_row is not None and not store.artifact_exists(model_row):
+        st.warning(
+            f"Le modèle **{model_row['name']}** est enregistré mais son fichier "
+            f"`data/models/{model_row['id']}.joblib` est introuvable : aucune prédiction "
+            "ne peut être calculée. Le dossier `data/` n'étant pas versionné, les modèles "
+            "entraînés sur une autre machine ou effacés depuis doivent être ré-entraînés "
+            "(onglet 🛠️ Construire un modèle)."
+        )
+        model_row, strategy, strategy_id = None, None, None
 
     state = compute_current_player_state(dataset) if (model_row is not None and dataset is not None) else None
 
@@ -658,12 +790,20 @@ def render_upcoming(dataset: pd.DataFrame = None):
     log_prices = st.session_state.get("upc_log_prices", True)
     n_logged = 0
 
+    # Journal des paris (app.bet_log): même mécanique, piloté par un widget rendu
+    # en bas de page. Chaque signal de la stratégie sélectionnée est enregistré
+    # comme un pari flat, aux cotes du moment — c'est ce journal qui alimente
+    # l'onglet 💰 Bankroll.
+    log_bets = st.session_state.get("upc_log_bets", True)
+    n_bets_logged = 0
+
     for tourney in tournois:
         sub = df[df["tournoi"] == tourney].reset_index(drop=True)
         if sub.empty:
             continue
-        sub["surface"] = _guess_surface(tourney, dataset) if dataset is not None else None
-        sub = _attach_model_predictions(sub, model_row, state)
+        tourney_ctx = _guess_tourney_context(tourney, dataset) if dataset is not None else {}
+        sub["surface"] = tourney_ctx.get("surface")
+        sub = _attach_model_predictions(sub, model_row, state, tourney_ctx)
         sub = _attach_bet_signals(sub, strategy)
         n_signals = int(sub["bet_side"].notna().sum())
         total_signals += n_signals
@@ -674,6 +814,8 @@ def render_upcoming(dataset: pd.DataFrame = None):
                 sub, _signal_odds_from_row,
                 model_id=model_row["id"] if model_row is not None else None,
             )
+        if log_bets and strategy_id and n_signals:
+            n_bets_logged += bet_log.record_signals(sub, strategy_id, strategy_name, strategy)
 
         title = f"🏆 {tourney} ({len(sub)} matchs)"
         if n_signals:
@@ -779,7 +921,47 @@ def render_upcoming(dataset: pd.DataFrame = None):
     if selected_match is not None:
         _render_match_detail(selected_match, dataset, model_row, strategy, strategy_name)
 
+    _render_bet_log_panel(n_bets_logged, strategy_id, strategy_name)
     _render_price_log_panel(n_logged)
+
+
+def _render_bet_log_panel(n_logged: int, strategy_id: str, strategy_name: str):
+    """Pilotage et état du journal des paris (cf. app.bet_log): c'est lui qui
+    transforme les signaux affichés ci-dessus en un relevé de performance réelle,
+    exploité par l'onglet 💰 Bankroll."""
+    with st.expander("🧾 Journal des paris de la stratégie (onglet 💰 Bankroll)", expanded=bool(n_logged)):
+        st.checkbox(
+            "Enregistrer les signaux comme paris flat", value=True, key="upc_log_bets",
+            help="Un pari par match et par stratégie, au premier signal — les consultations "
+                 "suivantes ne réécrivent pas la cote enregistrée.",
+        )
+        st.caption(
+            "Chaque opportunité signalée ci-dessus est enregistrée comme un pari à mise flat de "
+            "1 unité, à la cote disponible au moment du signal, sur un match pas encore joué. "
+            "Une fois le match dans `data/tennis.db`, le pari est réglé automatiquement et vient "
+            "alimenter la courbe de bankroll de l'onglet 💰 Bankroll. C'est la seule mesure de "
+            "performance **hors échantillon** : le ROI du backtest, lui, vient d'un jeu de test "
+            "déjà exploré des centaines de fois par la recherche de règle."
+        )
+
+        if not strategy_id:
+            st.info(
+                "Aucune stratégie sélectionnée ci-dessus (un modèle seul 🤖 ne produit pas de "
+                "signal) — rien n'est enregistré."
+            )
+            return
+
+        bets = bet_log.list_bets(strategy_id)
+        if n_logged:
+            st.success(f"➕ {n_logged} nouveau(x) pari(s) enregistré(s) à l'instant pour **{strategy_name}**.")
+        if bets.empty:
+            st.info("Aucun pari enregistré pour cette stratégie pour l'instant.")
+            return
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Paris enregistrés", len(bets))
+        m2.metric("En attente", int((bets["status"] == bet_log.PENDING).sum()))
+        m3.metric("Réglés", int((bets["status"] != bet_log.PENDING).sum()))
 
 
 def _render_price_log_panel(n_logged: int):

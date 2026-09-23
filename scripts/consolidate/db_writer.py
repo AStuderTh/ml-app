@@ -6,14 +6,15 @@ import sqlite3
 
 import pandas as pd
 
-MATCHES_SCHEMA_HINTS = {
-    "tourney_date": "TEXT",
-    "has_pending_review": "INTEGER",
-}
+DATE_COLUMNS = ["tourney_date", "match_date"]
 
 NUMERIC_COLUMNS = [
     "winner_ht", "winner_age", "winner_rank", "winner_rank_points",
     "loser_ht", "loser_age", "loser_rank", "loser_rank_points",
+    "winner_player_id", "loser_player_id",
+    "winner_atp_rank", "winner_atp_points", "winner_atp_rank_prev", "winner_atp_points_prev",
+    "loser_atp_rank", "loser_atp_points", "loser_atp_rank_prev", "loser_atp_points_prev",
+    "has_pending_odds",
     "best_of", "minutes", "draw_size",
     "w_ace", "w_df", "w_svpt", "w_1stIn", "w_1stWon", "w_2ndWon", "w_SvGms", "w_bpSaved", "w_bpFaced",
     "l_ace", "l_df", "l_svpt", "l_1stIn", "l_1stWon", "l_2ndWon", "l_SvGms", "l_bpSaved", "l_bpFaced",
@@ -27,7 +28,9 @@ def write_sqlite(db_path: str, matches_df: pd.DataFrame, review_df: pd.DataFrame
     con = sqlite3.connect(db_path)
     try:
         df = matches_df.copy()
-        df["tourney_date"] = pd.to_datetime(df["tourney_date"]).dt.strftime("%Y-%m-%d")
+        for col in DATE_COLUMNS:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%Y-%m-%d")
         # certaines colonnes numériques finissent en dtype 'object' après la
         # fusion des 3 sources (mélange int/float/None selon la ligne), ce
         # qui les ferait écrire en TEXT dans sqlite: on force le typage ici.
@@ -40,6 +43,9 @@ def write_sqlite(db_path: str, matches_df: pd.DataFrame, review_df: pd.DataFrame
         con.execute("CREATE INDEX idx_matches_winner ON matches(winner_name)")
         con.execute("CREATE INDEX idx_matches_loser ON matches(loser_name)")
         con.execute("CREATE INDEX idx_matches_confidence ON matches(match_confidence)")
+        # les features s'indexent désormais sur l'identité joueur, pas sur le nom
+        con.execute("CREATE INDEX idx_matches_wpid ON matches(winner_player_id)")
+        con.execute("CREATE INDEX idx_matches_lpid ON matches(loser_player_id)")
 
         review_df.to_sql("match_review", con, if_exists="replace", index=False)
         con.commit()

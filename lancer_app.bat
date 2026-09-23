@@ -8,9 +8,8 @@ for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":8501" ^| findstr "LISTENING
     taskkill /F /PID %%p >nul 2>&1
 )
 
-if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" -m streamlit run app\streamlit_app.py
-) else (
-    python -m streamlit run app\streamlit_app.py
-)
+set "PYTHON=python"
+if exist ".venv\Scripts\python.exe" set "PYTHON=.venv\Scripts\python.exe"
+
+"%PYTHON%" -m streamlit run app\streamlit_app.py
 pause

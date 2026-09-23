@@ -17,7 +17,7 @@ The application is intended for research and education. Backtest results are not
 
 ## Requirements
 
-- Python 3.11 to 3.13 (Python 3.13 is recommended on Windows)
+- Python 3.11 to 3.14 (Python 3.14 is recommended on Windows)
 - Git, available on `PATH` (needed to download the historical repositories)
 - Internet access for the first data build and optional live odds providers
 
@@ -32,7 +32,7 @@ The scikit-learn version is pinned because saved Joblib models are version-sensi
 ```powershell
 git clone https://github.com/AStuderTh/ml-app.git
 cd ml-app
-py -3.13 -m venv .venv
+py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
@@ -50,7 +50,7 @@ If Windows reports `DLL load failed` while importing pandas, repair the virtual 
 .\.venv\Scripts\python.exe -m pip install --force-reinstall --no-cache-dir pandas numpy
 ```
 
-If that does not work, remove `.venv`, recreate it with Python 3.13, and run the installation commands again. Some Windows application-control policies block native SciPy DLLs in Python 3.14 environments.
+If that does not work, remove `.venv`, recreate it with Python 3.14, and run the installation commands again. Some Windows application-control policies can block native SciPy DLLs.
 
 ### macOS/Linux
 
@@ -75,7 +75,7 @@ Open the **Data** tab and click **Update database**. On a fresh checkout, the up
 
 1. Creates the `data/` directory.
 2. Clones or updates the `tennis_atp` history repository.
-3. Clones or updates the `TML-Database` history repository.
+3. Downloads the current and previous ATP seasons from the TML API.
 4. Downloads the current and previous seasons from `tennis-data.co.uk`.
 5. Consolidates the three sources, removes duplicates, and writes `data/tennis.db`.
 

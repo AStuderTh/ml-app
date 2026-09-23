@@ -11,6 +11,8 @@ DEFAULT_STRATEGY = {
     "flat_stake": 1.0,
     "kelly_fraction": 0.25,     # fraction du Kelly plein (gestion du risque)
     "bankroll": 100.0,
+    "min_odds": None,           # None = pas de borne
+    "max_odds": None,
 }
 
 
@@ -28,8 +30,28 @@ def run_backtest(probs_p1: np.ndarray, test_df: pd.DataFrame, strategy: dict) ->
     edge_p1 = model_p1 - implied_p1
     edge_p2 = model_p2 - implied_p2
 
-    bet_p1 = (edge_p1 >= strat["edge_threshold"]) & (edge_p1 >= edge_p2)
-    bet_p2 = (~bet_p1) & (edge_p2 >= strat["edge_threshold"])
+    # Filtre optionnel de cote: exclut les grosses faveurs (edge mécaniquement
+    # gonflé par une petite erreur de calibration près de p=1) et/ou les gros
+    # outsiders (variance élevée pour un edge nominal identique), indépendamment
+    # du seuil d'edge lui-même.
+    min_odds, max_odds = strat["min_odds"], strat["max_odds"]
+
+    def _odds_ok(odds):
+        ok = np.ones(len(odds), dtype=bool)
+        if min_odds is not None:
+            ok &= odds >= min_odds
+        if max_odds is not None:
+            ok &= odds <= max_odds
+        return ok
+
+    bet_p1 = (edge_p1 >= strat["edge_threshold"]) & (edge_p1 >= edge_p2) & _odds_ok(odds_p1)
+    bet_p2 = (~bet_p1) & (edge_p2 >= strat["edge_threshold"]) & _odds_ok(odds_p2)
+
+    # Absent des jeux de test allégés enregistrés avant l'ajout du découpage par
+    # segment (cf. BACKTEST_COLS): on dégrade au lieu de lever, sinon rejouer un
+    # modèle sauvegardé de l'ancienne génération casse.
+    levels = (test_df["tourney_level"].values if "tourney_level" in test_df.columns
+              else np.full(len(test_df), None))
 
     rows = []
     bankroll = strat["bankroll"]
@@ -61,6 +83,7 @@ def run_backtest(probs_p1: np.ndarray, test_df: pd.DataFrame, strategy: dict) ->
             "side": side, "odds": odds, "model_prob": p, "stake": stake,
             "won": bool(won), "profit": profit, "bankroll_after": bankroll,
             "surface": test_df["surface"].values[i],
+            "tourney_level": levels[i],
         })
 
     bets_df = pd.DataFrame(rows)
@@ -83,3 +106,51 @@ def run_backtest(probs_p1: np.ndarray, test_df: pd.DataFrame, strategy: dict) ->
         max_drawdown=float(drawdown.max(skipna=True) or 0.0),
     )
     return bets_df, metrics
+
+
+# Niveaux servis par un fournisseur de cotes AVANT match (cf. app/odds.py:
+# The Odds API ne couvre que les Grand Chelems et les Masters/500 principaux).
+# Un ROI porté par les niveaux absents de cet ensemble n'est pas jouable en
+# production, quelle que soit sa solidité statistique en backtest.
+LIVE_ODDS_LEVELS = {"G", "M"}
+
+
+def segment_metrics(bets_df: pd.DataFrame, by: str = "tourney_level") -> pd.DataFrame:
+    """ROI décomposé par segment de marché.
+
+    Le ROI global mélange des marchés d'efficience très différente: une finale
+    de Grand Chelem absorbe des millions et une vingtaine de modèles
+    professionnels, un 1er tour d'ATP 250 absorbe quelques milliers d'euros et
+    une ligne largement automatisée. L'erreur du marché n'est pas répartie
+    uniformément, donc un ROI global n'est pas une quantité interprétable: il
+    faut savoir QUEL segment le porte, et si ce segment est pariable.
+    """
+    if bets_df is None or bets_df.empty or by not in bets_df.columns:
+        return pd.DataFrame()
+
+    g = bets_df.groupby(by, dropna=False)
+    out = pd.DataFrame({
+        "n_bets": g.size(),
+        "staked": g["stake"].sum(),
+        "profit": g["profit"].sum(),
+        "win_rate": g["won"].mean(),
+        "avg_odds": g["odds"].mean(),
+    })
+    out["roi"] = out["profit"] / out["staked"].replace(0, np.nan)
+
+    # Erreur-type EMPIRIQUE du ROI, et non une approximation analytique: les
+    # mises varient (Kelly) et les cotes sont très dispersées, donc l'écart-type
+    # réalisé des profits est le seul estimateur honnête. Sans cette colonne, un
+    # ROI de +8% sur 40 paris se lit comme un signal alors que son incertitude
+    # est de l'ordre de ±25 points.
+    avg_stake = out["staked"] / out["n_bets"]
+    out["roi_se"] = g["profit"].std() / np.sqrt(out["n_bets"]) / avg_stake.replace(0, np.nan)
+
+    # |ROI| > 2 erreurs-types: seuil grossier, mais il suffit à écarter les
+    # segments où le signe du ROI est indiscernable du hasard.
+    out["significatif"] = out["roi"].abs() > 2 * out["roi_se"]
+
+    if by == "tourney_level":
+        out["pariable_live"] = [lvl in LIVE_ODDS_LEVELS for lvl in out.index]
+
+    return out.sort_values("n_bets", ascending=False)

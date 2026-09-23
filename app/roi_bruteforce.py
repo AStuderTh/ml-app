@@ -13,6 +13,15 @@ STAKE_MODES = ["flat", "kelly"]
 
 def sample_strategy(rng: np.random.Generator) -> dict:
     stake_mode = STAKE_MODES[rng.integers(0, len(STAKE_MODES))]
+
+    # Bornes de cote tirées séparément, avec 50% de chance chacune d'être
+    # désactivée (None): le bruteforce doit pouvoir retomber sur une stratégie
+    # sans filtre de cote aussi bien que sur une stratégie bornée.
+    min_odds = float(rng.uniform(1.01, 3.0)) if rng.random() < 0.5 else None
+    max_odds = float(rng.uniform(3.0, 15.0)) if rng.random() < 0.5 else None
+    if min_odds is not None and max_odds is not None and min_odds >= max_odds:
+        min_odds, max_odds = max_odds, min_odds
+
     return {
         "edge_threshold": float(rng.uniform(0.0, 0.15)),
         "stake_mode": stake_mode,
@@ -22,6 +31,8 @@ def sample_strategy(rng: np.random.Generator) -> dict:
         # tableau de résultats, mais présent dans le JSON sauvegardé si on le tirait quand même).
         "kelly_fraction": float(rng.uniform(0.05, 1.0)) if stake_mode == "kelly" else None,
         "bankroll": 100.0,
+        "min_odds": min_odds,
+        "max_odds": max_odds,
     }
 
 

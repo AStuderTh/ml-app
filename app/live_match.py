@@ -23,7 +23,8 @@ import streamlit as st
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from app.features import DEFAULT_ELO, elo_decay
+from app.features import (DEFAULT_ELO, TOUR_AVG_RETURN, TOUR_AVG_SERVE, _adjust,
+                           _RateTracker, elo_decay)
 from scripts.consolidate.normalize import given_initials, norm_name_full, parse_abbrev_name, surname_guess
 
 FEATURE_LABELS = {
@@ -43,6 +44,17 @@ FEATURE_LABELS = {
     "surface_clay": "Sur terre battue",
     "surface_grass": "Sur gazon",
     "surface_hard": "Sur dur",
+    "points_dominance_diff": "Écart de domination aux points (service + retour)",
+    "points_dominance_surface_diff": "Écart de domination aux points (par surface)",
+    "rest_days_diff": "Écart de jours de repos",
+    "minutes_14d_diff": "Écart de minutes jouées (14 j)",
+    "matches_14d_diff": "Écart de matchs joués (14 j)",
+    "long_match_prev_diff": "Match précédent long (> 3 h)",
+    "is_indoor": "Match en salle",
+    "level_grandslam": "Grand Chelem",
+    "level_masters": "Masters 1000",
+    "level_finals": "Masters de fin d'année",
+    "best_of_5": "Format en 5 sets",
 }
 
 
@@ -102,9 +114,20 @@ def compute_current_player_state(matches: pd.DataFrame, elo_k: float = 32.0, for
     last_seen = {}
     last_seen_surface = defaultdict(dict)  # surface -> {joueur: date}
 
+    # Domination aux points (service/retour): mêmes accumulateurs bayésiens
+    # décroissants que app.features.compute_chronological_features (réutilisés
+    # via _RateTracker/_adjust pour rester cohérents avec l'entraînement), mais
+    # ici on ne garde que l'ÉTAT FINAL (comme pour l'Elo ci-dessus) et non une
+    # valeur pré-match par ligne.
+    srv = _RateTracker(TOUR_AVG_SERVE)
+    ret = _RateTracker(TOUR_AVG_RETURN)
+    srv_surf = defaultdict(lambda: _RateTracker(TOUR_AVG_SERVE))
+    ret_surf = defaultdict(lambda: _RateTracker(TOUR_AVG_RETURN))
+
     cols = ["winner_name", "loser_name", "surface",
             "winner_rank", "winner_rank_points", "winner_age", "winner_ht", "winner_hand",
             "loser_rank", "loser_rank_points", "loser_age", "loser_ht", "loser_hand",
+            "w_svpt", "l_svpt", "w_1stWon", "w_2ndWon", "l_1stWon", "l_2ndWon",
             "tourney_date"]
     for row in df[cols].itertuples(index=False):
         w = variant_to_canon.get(row.winner_name)
@@ -146,6 +169,22 @@ def compute_current_player_state(matches: pd.DataFrame, elo_k: float = 32.0, for
             )
             last_seen_surface[surf][name] = row.tourney_date
 
+        # points de service/retour: seuls certains matchs (source Sackmann/TML)
+        # en disposent — cf. app.features.compute_chronological_features, même
+        # garde-fou (wp/lp > 0, ww/lw non NaN).
+        wp, lp = row.w_svpt, row.l_svpt
+        ww = row.w_1stWon + row.w_2ndWon if pd.notna(row.w_1stWon) and pd.notna(row.w_2ndWon) else float("nan")
+        lw = row.l_1stWon + row.l_2ndWon if pd.notna(row.l_1stWon) and pd.notna(row.l_2ndWon) else float("nan")
+        if pd.notna(wp) and pd.notna(lp) and wp > 0 and lp > 0 and pd.notna(ww) and pd.notna(lw):
+            srv.update(w, ww, wp)
+            srv.update(l, lw, lp)
+            ret.update(w, lp - lw, lp)
+            ret.update(l, wp - ww, wp)
+            srv_surf[surf].update(w, ww, wp)
+            srv_surf[surf].update(l, lw, lp)
+            ret_surf[surf].update(w, lp - lw, lp)
+            ret_surf[surf].update(l, wp - ww, wp)
+
     return {
         "elo": dict(elo),
         "elo_surf": {s: dict(d) for s, d in elo_surf.items()},
@@ -155,6 +194,10 @@ def compute_current_player_state(matches: pd.DataFrame, elo_k: float = 32.0, for
         "last_seen": last_seen,
         "last_seen_surface": dict(last_seen_surface),
         "key_to_canon": key_to_canon,
+        "srv": srv,
+        "ret": ret,
+        "srv_surf": dict(srv_surf),
+        "ret_surf": dict(ret_surf),
     }
 
 
@@ -186,6 +229,8 @@ def player_snapshot(state: dict, canon_name: str, surface: str, as_of=None) -> d
     last_surf_date = state.get("last_seen_surface", {}).get(surface or "Hard", {}).get(canon_name)
     days_inactive = (as_of - last_date).days if pd.notna(last_date) else None
     days_inactive_surf = (as_of - last_surf_date).days if pd.notna(last_surf_date) else None
+    srv_surf_t = state.get("srv_surf", {}).get(surface or "Hard")
+    ret_surf_t = state.get("ret_surf", {}).get(surface or "Hard")
     return {
         "elo": elo,
         "elo_surface": elo_surface,
@@ -196,15 +241,44 @@ def player_snapshot(state: dict, canon_name: str, surface: str, as_of=None) -> d
         "rank": ls.get("rank"), "rank_points": ls.get("rank_points"),
         "age": ls.get("age"), "ht": ls.get("ht"), "hand": ls.get("hand"),
         "last_match_date": ls.get("date"),
+        "srv_raw": state["srv"].estimate(canon_name) if "srv" in state else None,
+        "ret_raw": state["ret"].estimate(canon_name) if "ret" in state else None,
+        "srv_surf_raw": srv_surf_t.estimate(canon_name) if srv_surf_t else None,
+        "ret_surf_raw": ret_surf_t.estimate(canon_name) if ret_surf_t else None,
     }
 
 
 def build_live_features(snap1: dict, snap2: dict, state: dict, canon1: str, canon2: str,
-                         feature_names: list, surface: str, implied_prob_p1: float = None) -> tuple[dict, list]:
+                         feature_names: list, surface: str, implied_prob_p1: float = None,
+                         best_of: float = None, indoor: str = None) -> tuple[dict, list]:
     """Construit les valeurs de features pour p1 vs p2. Retourne (valeurs,
-    features manquantes — le modèle ne pourra pas être utilisé si non vide)."""
+    features manquantes — le modèle ne pourra pas être utilisé si non vide).
+
+    best_of/indoor: dernières valeurs connues du tournoi (deviné par
+    app.upcoming._guess_tourney_context à partir de l'historique du même
+    tournoi) — ne dépendent pas du joueur, contrairement au reste des
+    features."""
     h2h1 = state["h2h"].get(canon1, {}).get(canon2, 0)
     h2h2 = state["h2h"].get(canon2, {}).get(canon1, 0)
+
+    bo_known = best_of is not None and pd.notna(best_of)
+    indoor_str = str(indoor).upper() if (indoor is not None and pd.notna(indoor)) else None
+
+    # Domination aux points: même ajustement à la force de l'adversaire qu'à
+    # l'entraînement (cf. app.features._adjust) — None tant que l'un des deux
+    # joueurs n'a pas assez de points observés (MIN_SERVE_POINTS).
+    def _dominance_diff(srv1, ret1, srv2, ret2):
+        dom1 = _adjust(srv1, ret2, TOUR_AVG_RETURN)
+        dom2 = _adjust(srv2, ret1, TOUR_AVG_RETURN)
+        if dom1 is None or dom2 is None:
+            return None
+        return dom1 - dom2
+
+    points_dominance_diff = _dominance_diff(
+        snap1.get("srv_raw"), snap1.get("ret_raw"), snap2.get("srv_raw"), snap2.get("ret_raw"))
+    points_dominance_surface_diff = _dominance_diff(
+        snap1.get("srv_surf_raw"), snap1.get("ret_surf_raw"),
+        snap2.get("srv_surf_raw"), snap2.get("ret_surf_raw"))
 
     computed = {
         "elo_diff": snap1["elo"] - snap2["elo"],
@@ -223,6 +297,10 @@ def build_live_features(snap1: dict, snap2: dict, state: dict, canon1: str, cano
         "surface_clay": 1.0 if surface == "Clay" else 0.0,
         "surface_grass": 1.0 if surface == "Grass" else 0.0,
         "surface_hard": 1.0 if surface == "Hard" else 0.0,
+        "best_of_5": (1.0 if float(best_of) == 5 else 0.0) if bo_known else None,
+        "is_indoor": (1.0 if indoor_str == "I" else 0.0) if indoor_str in ("I", "O") else None,
+        "points_dominance_diff": points_dominance_diff,
+        "points_dominance_surface_diff": points_dominance_surface_diff,
     }
 
     values = {f: computed.get(f) for f in feature_names}

@@ -1,14 +1,14 @@
-"""Appariement des matchs entre sources.
+"""Appariement approximatif de la colonne vertébrale avec tennis-data.co.
 
-Deux étapes, chacune produisant des paires "auto" (fusionnées directement) et
-des paires "à valider" (ajoutées à la file de validation manuelle, voir
-review_io.py) :
+C'est le SEUL appariement flou du pipeline, et il ne sert qu'à attacher des
+cotes: tennis-data.co ne partage aucun identifiant avec les autres sources
+(tournoi/tour/noms abrégés uniquement). Le rapprochement Sackmann <-> TML,
+lui, se fait sur clé exacte dans `spine.py` — deux référentiels quasi
+identiques n'ont pas besoin de logique floue, et lui en donner produisait
+surtout des doublons.
 
-  1. Sackmann <-> TML          (clé quasi exacte: tid_norm + round + noms)
-  2. (Sackmann+TML) <-> tennis-data.co   (aucun id commun: tournoi/round/noms approx.)
-
-Rien n'est jamais silencieusement supprimé: ce qui n'est pas apparié reste
-comme enregistrement autonome (source unique) dans la sortie finale.
+Un couple non apparié ne coûte qu'une cote manquante (cf. odds_attach.py):
+rien n'est supprimé, et rien n'est dupliqué.
 """
 from dataclasses import dataclass, field
 
@@ -18,6 +18,13 @@ from . import normalize as nm
 
 AUTO_THRESHOLD = 0.75
 REVIEW_FLOOR = 0.45
+
+# Recouvrement de plateau (Jaccard) au-dessus duquel on considère tenir une
+# preuve DIRECTE que deux instances de tournoi sont la même. Fixé sous le
+# plafond réaliste (~0.7) d'un vrai couple: les deux sources ne couvrent pas
+# exactement les mêmes tours, donc le Jaccard d'un vrai couple n'atteint
+# jamais 1.
+ROSTER_EVIDENCE_FLOOR = 0.50
 
 
 def greedy_bipartite_match(scored_pairs):
@@ -44,73 +51,6 @@ class MatchResult:
     unmatched_b: set = field(default_factory=set)
 
 
-def match_sackmann_tml(sack: pd.DataFrame, tml: pd.DataFrame) -> MatchResult:
-    result = MatchResult(unmatched_a=set(sack.index), unmatched_b=set(tml.index))
-
-    # --- tier 1: clé exacte (tid_norm, round, {noms complets normalisés}) ---
-    def key_of(row):
-        return (row["tid_norm"], row["round"], frozenset([row["wn"], row["ln"]]))
-
-    tml_by_key = {}
-    for j, row in tml.iterrows():
-        tml_by_key.setdefault(key_of(row), []).append(j)
-
-    for i, row in sack.iterrows():
-        cands = tml_by_key.get(key_of(row))
-        if cands:
-            j = cands.pop(0)
-            result.auto_pairs.append((i, j, 1.0, "exact_key"))
-            result.unmatched_a.discard(i)
-            result.unmatched_b.discard(j)
-
-    # --- tier 2: appariement flou par groupe (tid_norm, round) ---
-    def _fuzzy_pass(group_cols, reason_auto, reason_review, name_only=False):
-        remaining_sack = sack.loc[list(result.unmatched_a)]
-        remaining_tml = tml.loc[list(result.unmatched_b)]
-        if remaining_sack.empty or remaining_tml.empty:
-            return
-        groups_a = remaining_sack.groupby(group_cols).groups
-        groups_b = remaining_tml.groupby(group_cols).groups
-
-        for gkey, idx_a in groups_a.items():
-            idx_b = groups_b.get(gkey)
-            if idx_b is None or len(idx_b) == 0:
-                continue
-            pairs = []
-            for i in idx_a:
-                ra = sack.loc[i]
-                for j in idx_b:
-                    rb = tml.loc[j]
-                    wscore = nm.best_surname_score(ra["wn"], rb["wn"])
-                    lscore = nm.best_surname_score(ra["ln"], rb["ln"])
-                    score = (wscore + lscore) / 2
-                    if name_only:
-                        # pas de tid en commun ici: on exige en plus une
-                        # cohérence minimale du nom de tournoi pour éviter
-                        # de confondre deux tournois disputés la même semaine
-                        tsim = nm.tourney_name_similarity(ra["tourney_name"], rb["tourney_name"])
-                        score = score * (0.5 + 0.5 * tsim)
-                    if score >= REVIEW_FLOOR:
-                        pairs.append((i, j, score))
-            for i, j, score in greedy_bipartite_match(pairs):
-                if score >= AUTO_THRESHOLD:
-                    result.auto_pairs.append((i, j, score, reason_auto))
-                else:
-                    result.review_pairs.append((i, j, score, reason_review))
-                result.unmatched_a.discard(i)
-                result.unmatched_b.discard(j)
-
-    _fuzzy_pass(["tid_norm", "round"], "fuzzy_name", "fuzzy_name_low_confidence")
-    # --- tier 2b: repli quand le tourney_id diverge carrément entre sources
-    # (arrive pour certains tournois, ex. Sydney = 'M001' chez Sackmann vs
-    # '338' chez TML) mais que la date de la semaine de tournoi, elle,
-    # concorde presque toujours entre les deux sources.
-    _fuzzy_pass(["tourney_date", "round"], "fuzzy_name_date_fallback",
-                "fuzzy_name_date_fallback_low_confidence", name_only=True)
-
-    return result
-
-
 def match_with_tennisdata(fused: pd.DataFrame, td: pd.DataFrame) -> MatchResult:
     """fused: pool Sackmann+TML déjà consolidé (une ligne par match), avec
     colonnes w_surname/l_surname/w_ginit/l_ginit/tourney_name/tourney_date/round.
@@ -118,8 +58,20 @@ def match_with_tennisdata(fused: pd.DataFrame, td: pd.DataFrame) -> MatchResult:
     tourney_name_norm/year/round_rank/is_rr."""
     result = MatchResult(unmatched_a=set(fused.index), unmatched_b=set(td.index))
 
-    fused = fused.copy()
-    fused["tourney_name_norm"] = fused["tourney_name"].map(nm.norm_tourney_name)
+    # frame de travail réduit aux seules colonnes d'appariement: le `fused`
+    # reçu porte tout le schéma final (plusieurs dizaines de colonnes, blocs
+    # fragmentés), le copier intégralement coûte des centaines de Mo et ralentit
+    # chaque `.loc` de sous-groupe.
+    fused = pd.DataFrame({
+        "wn": fused["wn"].to_numpy(),
+        "ln": fused["ln"].to_numpy(),
+        "w_ginit": fused["w_ginit"].to_numpy(),
+        "l_ginit": fused["l_ginit"].to_numpy(),
+        "round": fused["round"].to_numpy(),
+        "round_rank": fused["round_rank"].to_numpy(),
+        "tourney_date": pd.to_datetime(fused["tourney_date"]).to_numpy(),
+        "tourney_name_norm": fused["tourney_name"].map(nm.norm_tourney_name).to_numpy(),
+    }, index=fused.index)
     fused["year"] = pd.to_datetime(fused["tourney_date"]).dt.year
 
     # --- association des instances de tournoi (année + nom normalisé) ---
@@ -171,19 +123,41 @@ def match_with_tennisdata(fused: pd.DataFrame, td: pd.DataFrame) -> MatchResult:
         for cand in same_year.tourney_name_norm:
             fkey = (year, cand)
             score = nm.tourney_name_similarity(td_name, cand)
-            # le plateau n'est confronté que si les deux instances tombent la
+            # Deux NIVEAUX DE PREUVE, et le plateau prime sur le nom.
+            #
+            # Un plateau de joueurs partagé est une preuve directe: deux
+            # tournois distincts ont des plateaux disjoints. Un alias de
+            # sponsor n'est qu'une preuve indirecte, adossée à une table tenue
+            # à la main qui vieillit à chaque renommage commercial.
+            #
+            # Sans cette hiérarchie, un alias erroné ne se contente pas de se
+            # tromper: il fabrique un 2e candidat à 0.95 qui DÉTRUIT LA MARGE
+            # du vrai tournoi (pourtant à 1.0) et fait rejeter le bon
+            # rapprochement. C'est ce qui privait ~60 éditions de leurs cotes.
+            # Le plateau n'est confronté que si les deux instances tombent la
             # même semaine: sans cette garde, deux étapes successives d'une
             # même tournée (plateaux très proches) pourraient se relier.
+            tier = 0
             f_st = f_start.get(fkey)
             if td_start is not None and f_st is not None and abs((f_st - td_start).days) <= 10:
-                score = max(score, _player_overlap(fkey, tkey))
-            scored.append((score, cand))
+                ov = _player_overlap(fkey, tkey)
+                if ov >= ROSTER_EVIDENCE_FLOOR:
+                    tier, score = 1, max(score, ov)
+                else:
+                    score = max(score, ov)
+            scored.append((tier, score, cand))
         scored.sort(reverse=True)
         if not scored:
             continue
-        best_score, best_name = scored[0]
-        runner_up = scored[1][0] if len(scored) > 1 else 0.0
-        margin = best_score - runner_up
+        best_tier, best_score, best_name = scored[0]
+        if len(scored) > 1:
+            runner_tier, runner_score = scored[1][0], scored[1][1]
+        else:
+            runner_tier, runner_score = 0, 0.0
+        # la marge ne se calcule qu'entre candidats de MÊME niveau de preuve:
+        # un candidat "nom seul" ne peut pas opposer son veto à un candidat
+        # attesté par le plateau.
+        margin = best_score - runner_score if runner_tier == best_tier else 1.0
         # deux régimes d'acceptation. Le nom seul reste exigeant (0.72). La
         # preuve par le plateau tolère un score plus bas — les deux sources
         # ne couvrent pas exactement les mêmes tours, ce qui plafonne le
@@ -196,18 +170,33 @@ def match_with_tennisdata(fused: pd.DataFrame, td: pd.DataFrame) -> MatchResult:
     fused_groups = fused.groupby(["year", "tourney_name_norm"]).groups
     td_groups = td.groupby(["year", "tourney_name_norm"]).groups
 
-    def pair_score(fr, tr):
-        w = nm.best_surname_score(fr["wn"], tr["w_surname"])
-        if not nm.initials_compatible(tr["w_initials"], fr["w_ginit"]):
+    # Colonnes extraites une fois en tableaux numpy, et accès par POSITION dans
+    # la boucle d'appariement. Un `fused.loc[i]` y construit une Series de
+    # plusieurs dizaines d'éléments à chaque candidat: sur ~1 M de couples
+    # évalués, cet accès par label domine à lui seul le temps de consolidation
+    # (plus de 10 minutes contre quelques dizaines de secondes ici).
+    f_wn, f_ln = fused["wn"].to_numpy(), fused["ln"].to_numpy()
+    f_wg, f_lg = fused["w_ginit"].to_numpy(), fused["l_ginit"].to_numpy()
+    t_ws, t_ls = td["w_surname"].to_numpy(), td["l_surname"].to_numpy()
+    t_wi, t_li = td["w_initials"].to_numpy(), td["l_initials"].to_numpy()
+    f_pos = {lbl: p for p, lbl in enumerate(fused.index)}
+    t_pos = {lbl: p for p, lbl in enumerate(td.index)}
+
+    def pair_score(a, b):
+        """a/b: positions (et non labels) dans `fused` / `td`."""
+        ws, ls, wi, li = t_ws[b], t_ls[b], t_wi[b], t_li[b]
+        wn, ln, wg, lg = f_wn[a], f_ln[a], f_wg[a], f_lg[a]
+        w = nm.best_surname_score(wn, ws)
+        if not nm.initials_compatible(wi, wg):
             w *= 0.4
-        l = nm.best_surname_score(fr["ln"], tr["l_surname"])
-        if not nm.initials_compatible(tr["l_initials"], fr["l_ginit"]):
+        l = nm.best_surname_score(ln, ls)
+        if not nm.initials_compatible(li, lg):
             l *= 0.4
-        w_sw = nm.best_surname_score(fr["wn"], tr["l_surname"])
-        if not nm.initials_compatible(tr["l_initials"], fr["w_ginit"]):
+        w_sw = nm.best_surname_score(wn, ls)
+        if not nm.initials_compatible(li, wg):
             w_sw *= 0.4
-        l_sw = nm.best_surname_score(fr["ln"], tr["w_surname"])
-        if not nm.initials_compatible(tr["w_initials"], fr["l_ginit"]):
+        l_sw = nm.best_surname_score(ln, ws)
+        if not nm.initials_compatible(wi, lg):
             l_sw *= 0.4
         return (w + l) / 2, (w_sw + l_sw) / 2
 
@@ -245,11 +234,11 @@ def match_with_tennisdata(fused: pd.DataFrame, td: pd.DataFrame) -> MatchResult:
             if len(idx_a) == 0 or len(idx_b) == 0:
                 continue
             pairs, swapped_flag = [], {}
+            pos_b = [(j, t_pos[j]) for j in idx_b]
             for i in idx_a:
-                fr = fused.loc[i]
-                for j in idx_b:
-                    tr = td.loc[j]
-                    score, score_sw = pair_score(fr, tr)
+                a = f_pos[i]
+                for j, b in pos_b:
+                    score, score_sw = pair_score(a, b)
                     best = max(score, score_sw)
                     if best >= REVIEW_FLOOR:
                         pairs.append((i, j, best))

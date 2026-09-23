@@ -2,12 +2,16 @@
 mais qui conserve les décisions déjà saisies par l'utilisateur (identifiées
 par un id stable basé sur le contenu, pas la position dans le fichier).
 
+Depuis le passage à une hiérarchie de sources, cette file ne tranche plus
+l'EXISTENCE d'un match — jamais douteuse, puisque seule Sackmann peut créer
+une ligne — mais uniquement l'attribution d'une COTE tennis-data.co. Ne pas
+répondre est donc sans danger: le match reste en base, simplement sans cote.
+
 Colonne `decision` à remplir à la main:
-  - "merge"  : fusionner les deux enregistrements
-  - "reject" : ce ne sont PAS le même match, les garder séparés
-  - (vide)   : pas encore tranché -> les deux lignes restent séparées dans
-               la sortie, marquées has_pending_review=1, jusqu'à la prochaine
-               exécution après renseignement de cette colonne.
+  - "merge"  : c'est bien le même match -> les cotes sont attachées
+  - "reject" : ce n'est pas le même match -> aucune cote attachée
+  - (vide)   : pas encore tranché -> aucune cote attachée, la ligne est
+               marquée has_pending_odds=1 jusqu'à la prochaine exécution.
 """
 import hashlib
 import os

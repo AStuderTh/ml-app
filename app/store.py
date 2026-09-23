@@ -49,6 +49,14 @@ _MIGRATIONS = [
     # pour que le score de qualité (app.scoring.compute_quality_score) soit complet une
     # fois le modèle rechargé depuis la base plutôt que depuis un résultat frais.
     "ALTER TABLE saved_models ADD COLUMN ece REAL",
+    # Périmètre des données vu à l'entraînement. Sans ces deux colonnes, la
+    # validation glissante d'un modèle rechargé repartait de l'historique COMPLET:
+    # un modèle entraîné sur la seule terre battue se retrouvait confirmé sur dur
+    # et gazon, donc sur une population qu'il n'a jamais apprise — sa confirmation
+    # ne mesurait plus rien d'interprétable. NULL pour les modèles sauvegardés
+    # avant cet ajout, l'UI signale alors que le périmètre est inconnu.
+    "ALTER TABLE saved_models ADD COLUMN surfaces_json TEXT",
+    "ALTER TABLE saved_models ADD COLUMN exclude_retired INTEGER",
 ]
 
 # Règles de sélection (seuil d'edge, mode de mise) sauvegardées, associées à un
@@ -115,7 +123,8 @@ def _connect():
 
 
 def save_model(result: dict, name: str, train_start, train_end, test_start, test_end,
-               odds_w_col: str = None, odds_l_col: str = None) -> str:
+               odds_w_col: str = None, odds_l_col: str = None,
+               surfaces=None, exclude_retired: bool = None) -> str:
     model_id = uuid.uuid4().hex[:12]
     model_path = os.path.join(MODELS_DIR, f"{model_id}.joblib")
     bets_path = os.path.join(MODELS_DIR, f"{model_id}_bets.parquet")
@@ -136,8 +145,9 @@ def save_model(result: dict, name: str, train_start, train_end, test_start, test
                 train_start, train_end, test_start, test_end,
                 n_train, n_test, auc, accuracy, logloss, brier,
                 n_bets, roi, total_profit, win_rate, final_bankroll, max_drawdown,
-                created_at, model_path, bets_path, odds_w_col, odds_l_col, ece
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                created_at, model_path, bets_path, odds_w_col, odds_l_col, ece,
+                surfaces_json, exclude_retired
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 model_id, name, result["algo"],
                 json.dumps(result["params"]), json.dumps(result["features"]), json.dumps(result["strategy"]),
@@ -148,6 +158,8 @@ def save_model(result: dict, name: str, train_start, train_end, test_start, test
                 bt["final_bankroll"], bt["max_drawdown"],
                 datetime.now(timezone.utc).isoformat(),
                 model_path, bets_path, odds_w_col, odds_l_col, m.get("ece"),
+                json.dumps(list(surfaces)) if surfaces else None,
+                None if exclude_retired is None else int(exclude_retired),
             ),
         )
         con.commit()
@@ -165,23 +177,53 @@ def list_models() -> pd.DataFrame:
     return df
 
 
+def artifact_exists(model_row) -> bool:
+    """Le fichier .joblib d'un modèle enregistré est-il toujours sur le disque ?
+
+    Le registre (data/ml_models.db) et les artefacts (data/models/) sont deux
+    stockages distincts qui peuvent diverger: tout `data/` est ignoré par git,
+    donc un nettoyage du dépôt vide les .joblib sans rien retirer du registre.
+    """
+    path = model_row.get("model_path") if hasattr(model_row, "get") else model_row["model_path"]
+    return bool(path) and os.path.exists(path)
+
+
+def missing_model_ids() -> list:
+    """Modèles présents au registre mais dont l'artefact a disparu."""
+    df = list_models()
+    if df.empty:
+        return []
+    return [r["id"] for _, r in df.iterrows() if not artifact_exists(r)]
+
+
 def load_model_bets(model_id: str) -> pd.DataFrame:
     row = list_models()
     row = row[row.id == model_id]
     if row.empty or not row.iloc[0]["bets_path"]:
         return pd.DataFrame()
-    return pd.read_parquet(row.iloc[0]["bets_path"])
+    path = row.iloc[0]["bets_path"]
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_parquet(path)
 
 
 def load_model_object(model_id: str):
+    """Retourne None — plutôt que de lever — quand le modèle est inconnu OU
+    quand son fichier .joblib a disparu.
+
+    Laisser remonter le FileNotFoundError faisait planter la page entière de
+    l'app (onglet Matchs à venir), alors que tous les appelants savent déjà
+    traiter un modèle absent: c'est le même cas fonctionnel qu'un id inconnu.
+    Utiliser `missing_model_ids()` pour signaler ces modèles à l'utilisateur.
+    """
     row = list_models()
     row = row[row.id == model_id]
     if row.empty:
         return None
-    model_path = row.iloc[0]["model_path"]
-    if not model_path or not os.path.isfile(model_path):
+    path = row.iloc[0]["model_path"]
+    if not path or not os.path.exists(path):
         return None
-    return joblib.load(model_path)
+    return joblib.load(path)
 
 
 def load_test_frame_with_probs(model_id: str, dataset: pd.DataFrame, odds_w_col: str = None,
@@ -263,8 +305,9 @@ def duplicate_model(model_id: str, new_name: str) -> str:
                 train_start, train_end, test_start, test_end,
                 n_train, n_test, auc, accuracy, logloss, brier,
                 n_bets, roi, total_profit, win_rate, final_bankroll, max_drawdown,
-                created_at, model_path, bets_path, odds_w_col, odds_l_col, ece
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                created_at, model_path, bets_path, odds_w_col, odds_l_col, ece,
+                surfaces_json, exclude_retired
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 new_id, new_name, row["algo"], row["params_json"], row["features_json"], row["strategy_json"],
                 row["train_start"], row["train_end"], row["test_start"], row["test_end"],
@@ -273,6 +316,7 @@ def duplicate_model(model_id: str, new_name: str) -> str:
                 row["final_bankroll"], row["max_drawdown"],
                 datetime.now(timezone.utc).isoformat(), new_model_path, new_bets_path,
                 row["odds_w_col"], row["odds_l_col"], row.get("ece"),
+                row.get("surfaces_json"), row.get("exclude_retired"),
             ),
         )
         con.commit()

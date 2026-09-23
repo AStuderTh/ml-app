@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+from app import match_resolve
 from app.name_utils import normalize_name
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -217,26 +218,16 @@ def resolve_snapshots(dataset: pd.DataFrame, max_day_gap: int = 3) -> pd.DataFra
     if latest.empty:
         return pd.DataFrame()
 
-    hist = dataset.dropna(subset=["winner_name", "loser_name", "tourney_date"]).copy()
-    hist["_w"] = hist["winner_name"].map(lambda n: normalize_name(n).split()[-1] if normalize_name(n) else "")
-    hist["_l"] = hist["loser_name"].map(lambda n: normalize_name(n).split()[-1] if normalize_name(n) else "")
-    hist["_date"] = pd.to_datetime(hist["tourney_date"], errors="coerce")
+    hist = match_resolve.prepare_history(dataset)
 
     out = []
     for _, snap in latest.iterrows():
-        s1 = normalize_name(snap["joueur_1"]).split()[-1]
-        s2 = normalize_name(snap["joueur_2"]).split()[-1]
-        day = snap["date_utc"]
-        if pd.isna(day) or not s1 or not s2:
-            continue
-        window = hist[(hist["_date"] >= day.tz_localize(None) - pd.Timedelta(days=max_day_gap + 14))
-                      & (hist["_date"] <= day.tz_localize(None) + pd.Timedelta(days=max_day_gap))]
-        hit = window[((window["_w"] == s1) & (window["_l"] == s2))
-                     | ((window["_w"] == s2) & (window["_l"] == s1))]
-        if hit.empty:
+        j1_won = match_resolve.winner_of(hist, snap["date_utc"], snap["joueur_1"],
+                                          snap["joueur_2"], max_day_gap)
+        if j1_won is None:
             continue
         row = snap.to_dict()
-        row["j1_won"] = int(hit.iloc[0]["_w"] == s1)
+        row["j1_won"] = j1_won
         out.append(row)
 
     resolved = pd.DataFrame(out)

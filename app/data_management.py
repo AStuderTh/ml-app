@@ -71,9 +71,17 @@ def get_db_stats():
             # absent, pour laisser l'utilisateur relancer une mise à jour depuis zéro.
             return None
         total = con.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
-        max_date = con.execute("SELECT MAX(tourney_date) FROM matches").fetchone()[0]
+        # `tourney_date` est la date de DÉBUT du tournoi, identique pour tous
+        # les matchs d'une même édition: l'afficher comme "dernier match" fait
+        # croire à des données manquantes dès qu'un tournoi est en cours (un
+        # tournoi démarré le 20 y apparaît au 20, alors que sa finale s'est
+        # jouée le 26). `match_date` porte la date réelle quand elle est
+        # connue, d'où le COALESCE.
+        max_date = con.execute(
+            "SELECT MAX(COALESCE(match_date, tourney_date)) FROM matches").fetchone()[0]
         by_source = pd.read_sql(
-            "SELECT sources, COUNT(*) AS n_matchs, MAX(tourney_date) AS dernier_match "
+            "SELECT sources, COUNT(*) AS n_matchs, "
+            "MAX(COALESCE(match_date, tourney_date)) AS dernier_match "
             "FROM matches GROUP BY sources ORDER BY n_matchs DESC",
             con,
         )
@@ -95,9 +103,12 @@ def get_db_stats():
 def render_data_management():
     st.subheader("🗄️ Gestion des données")
     st.caption(
-        "data/tennis.db fusionne 3 sources : le dépôt git `tennis_atp` (Sackmann), le dépôt "
-        "git `TML-Database`, et les fichiers `tennis-data.co` (résultats + cotes, "
-        "téléchargés depuis tennis-data.co.uk)."
+        "data/tennis.db suit une hiérarchie de sources : `tennis_atp` (Sackmann) est la "
+        "colonne vertébrale — seule à définir un match et à porter l'identité joueur ; "
+        "`TML-Database` enrichit sur clé exacte (`indoor`) et couvre les tournois que "
+        "Sackmann n'a pas encore publiés ; `tennis-data.co` n'apporte que les cotes. "
+        "Une source secondaire ne peut jamais créer de ligne, ce qui garantit qu'un "
+        "match réel n'apparaît qu'une fois."
     )
 
     stats = get_db_stats()

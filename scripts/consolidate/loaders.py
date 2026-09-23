@@ -193,6 +193,15 @@ def load_tennisdata(data_dir: str) -> pd.DataFrame:
     df["l_surname"] = parsed_l.map(lambda t: nm.norm_name_full(t[0]))
     df["l_initials"] = parsed_l.map(lambda t: t[1])
 
+    # les colonnes de cotes contiennent '-' (voire des cellules vides) quand le
+    # bookmaker n'a pas coté le match: sans cette coercition, une seule de ces
+    # chaînes suffit à faire basculer toute la colonne en texte au moment de
+    # l'écriture en base — ou à lever une erreur de type à l'affectation.
+    for col in ("B365W", "B365L", "PSW", "PSL", "MaxW", "MaxL", "AvgW", "AvgL",
+                "WRank", "LRank", "WPts", "LPts", "Best of"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
     df["tourney_name_norm"] = df["Tournament"].map(nm.norm_tourney_name)
     df["year"] = _td_instance_year(df)
     df["score"] = df.apply(_td_score_string, axis=1)
