@@ -17,7 +17,7 @@ The application is intended for research and education. Backtest results are not
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.11 to 3.13 (Python 3.13 is recommended on Windows)
 - Git, available on `PATH` (needed to download the historical repositories)
 - Internet access for the first data build and optional live odds providers
 
@@ -30,7 +30,7 @@ The project does not require a pre-existing database, model, cache, or local dat
 ```powershell
 git clone https://github.com/AStuderTh/ml-app.git
 cd ml-app
-py -3.11 -m venv .venv
+py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
@@ -41,6 +41,14 @@ If PowerShell blocks activation, run the app with the virtual-environment execut
 ```powershell
 .\.venv\Scripts\python.exe -m streamlit run app\streamlit_app.py
 ```
+
+If Windows reports `DLL load failed` while importing pandas, repair the virtual environment's native wheels:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --force-reinstall --no-cache-dir pandas numpy
+```
+
+If that does not work, remove `.venv`, recreate it with Python 3.13, and run the installation commands again. Some Windows application-control policies block native SciPy DLLs in Python 3.14 environments.
 
 ### macOS/Linux
 
