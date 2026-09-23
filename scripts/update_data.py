@@ -4,7 +4,7 @@ Usage (CLI):
     python scripts/update_data.py
 
 Étapes:
-    1. git pull sur data/tennis_atp et data/TML-Database (dépôts amont)
+    1. clonage (ou git pull) de data/tennis_atp et data/TML-Database (dépôts amont)
     2. téléchargement du fichier tennis-data.co.uk de la saison en cours
        (+ année précédente, pour couvrir les tournois à cheval sur le
        nouvel an déjà présents en base mais dont l'année vient d'être
@@ -25,7 +25,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 DATA_DIR = os.path.join(ROOT, "data")
-GIT_REPOS = ["tennis_atp", "TML-Database"]
+GIT_REPOS = {
+    "tennis_atp": "https://github.com/Kadantte/tennis_atp.git",
+    "TML-Database": "https://github.com/Tennismylife/TML-Database.git",
+}
 TENNISDATA_BASE_URL = "http://www.tennis-data.co.uk"
 
 
@@ -36,26 +39,38 @@ def _log(msg, cb=None):
 
 
 def pull_git_repos(log=None):
-    """git pull --ff-only sur chaque dépôt amont. Un échec (conflit, pas de
-    réseau) sur l'un n'empêche pas d'essayer l'autre ni de continuer la
-    suite du pipeline avec les données déjà présentes localement."""
+    """Clone les sources absentes, sinon les met à jour avec git pull."""
+    os.makedirs(DATA_DIR, exist_ok=True)
     results = {}
-    for name in GIT_REPOS:
+    for name, url in GIT_REPOS.items():
         path = os.path.join(DATA_DIR, name)
-        if not os.path.isdir(os.path.join(path, ".git")):
-            _log(f"  [{name}] pas un dépôt git, ignoré", log)
-            continue
+        action = "vérification"
         try:
-            proc = subprocess.run(
-                ["git", "-C", path, "pull", "--ff-only"],
-                capture_output=True, text=True, timeout=120,
-            )
-            out = (proc.stdout + proc.stderr).strip()
-            ok = proc.returncode == 0
+            if not os.path.exists(path):
+                proc = subprocess.run(
+                    ["git", "clone", url, path],
+                    capture_output=True, text=True, timeout=600,
+                )
+                action = "clone"
+            elif os.path.isdir(os.path.join(path, ".git")):
+                proc = subprocess.run(
+                    ["git", "-C", path, "pull", "--ff-only"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                action = "pull"
+            else:
+                proc = None
+                action = "déjà présent mais invalide"
+            if proc is None:
+                out = "supprimez ce dossier puis relancez la mise à jour"
+                ok = False
+            else:
+                out = (proc.stdout + proc.stderr).strip()
+                ok = proc.returncode == 0
         except Exception as e:
             out, ok = str(e), False
-        _log(f"  [{name}] {'OK' if ok else 'ECHEC'} — {out or 'déjà à jour'}", log)
-        results[name] = {"ok": ok, "output": out}
+        _log(f"  [{name}] {'OK' if ok else 'ECHEC'} ({action}) — {out or 'déjà à jour'}", log)
+        results[name] = {"ok": ok, "action": action, "output": out}
     return results
 
 
