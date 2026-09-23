@@ -51,11 +51,14 @@ _MIGRATIONS = [
     "ALTER TABLE saved_models ADD COLUMN ece REAL",
 ]
 
-# Stratégies de mise sauvegardées, associées à un modèle (cf. app.roi_bruteforce
-# et la simulation ROI manuelle) — table séparée de saved_models: un même
-# modèle peut avoir plusieurs stratégies testées/gardées.
-ROI_STRATEGY_SCHEMA = """
-CREATE TABLE IF NOT EXISTS roi_strategies (
+# Règles de sélection (seuil d'edge, mode de mise) sauvegardées, associées à un
+# modèle (cf. app.roi_bruteforce et la simulation ROI manuelle) — table séparée
+# de saved_models: un même modèle peut avoir plusieurs règles testées/gardées.
+# Table nommée selection_rules (anciennement roi_strategies — renommée pour
+# rester cohérente avec le terme "règle de sélection" utilisé dans l'UI, cf.
+# _rename_legacy_tables ci-dessous pour la migration des bases existantes).
+SELECTION_RULE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS selection_rules (
     id TEXT PRIMARY KEY,
     model_id TEXT,
     name TEXT,
@@ -68,11 +71,41 @@ CREATE TABLE IF NOT EXISTS roi_strategies (
 )
 """
 
+# "Stratégies" (onglet 🎯 Stratégies): association explicite modèle + règle de
+# sélection, créée à la main par l'utilisateur (contrairement à selection_rules,
+# cette table est vide tant que l'utilisateur n'a rien ajouté lui-même).
+STRATEGY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS strategies (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    model_id TEXT,
+    rule_id TEXT,
+    created_at TEXT
+)
+"""
+
+
+def _rename_legacy_tables(con):
+    """Renomme roi_strategies -> selection_rules sur une base créée avant ce
+    renommage — fait AVANT la création des tables pour ne pas dupliquer les
+    anciennes données sous un nom vide. Les id des lignes ne changent pas, donc
+    `strategies.rule_id` (qui référence ces id) reste valide sans autre migration."""
+    existing = {row[0] for row in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if "roi_strategies" in existing and "selection_rules" not in existing:
+        con.execute("ALTER TABLE roi_strategies RENAME TO selection_rules")
+        # sans commit explicite ici, le rename reste dans une transaction non validée
+        # et disparaît silencieusement à la fermeture de la connexion
+        con.commit()
+
 
 def _connect():
     con = sqlite3.connect(DB_PATH)
+    _rename_legacy_tables(con)
     con.execute(SCHEMA)
-    con.execute(ROI_STRATEGY_SCHEMA)
+    con.execute(SELECTION_RULE_SCHEMA)
+    con.execute(STRATEGY_SCHEMA)
     for migration in _MIGRATIONS:
         try:
             con.execute(migration)
@@ -203,7 +236,7 @@ def rename_model(model_id: str, new_name: str):
 def duplicate_model(model_id: str, new_name: str) -> str:
     """Copie un modèle sauvegardé (fichiers joblib/parquet inclus, pas
     seulement la ligne en base) sous un nouvel id — un point de départ pour
-    l'éditer sans toucher à l'original. Les stratégies ROI associées à
+    l'éditer sans toucher à l'original. Les règles de sélection associées à
     l'original ne sont PAS dupliquées (elles resteront liées à l'original)."""
     row = list_models()
     row = row[row.id == model_id]
@@ -246,17 +279,19 @@ def duplicate_model(model_id: str, new_name: str) -> str:
 
 
 def delete_model(model_id: str):
-    """Supprime le modèle ET, en cascade, ses stratégies ROI sauvegardées
-    (une stratégie n'a aucun sens sans le modèle sur lequel elle a été
+    """Supprime le modèle ET, en cascade, ses règles de sélection sauvegardées
+    ainsi que les stratégies (onglet 🎯 Stratégies) qui le référencent (une
+    règle/stratégie n'a aucun sens sans le modèle sur lequel elle a été
     mesurée)."""
     con = _connect()
     try:
         row = con.execute("SELECT model_path, bets_path FROM saved_models WHERE id=?", (model_id,)).fetchone()
         strat_bets_paths = con.execute(
-            "SELECT bets_path FROM roi_strategies WHERE model_id=?", (model_id,)
+            "SELECT bets_path FROM selection_rules WHERE model_id=?", (model_id,)
         ).fetchall()
         con.execute("DELETE FROM saved_models WHERE id=?", (model_id,))
-        con.execute("DELETE FROM roi_strategies WHERE model_id=?", (model_id,))
+        con.execute("DELETE FROM selection_rules WHERE model_id=?", (model_id,))
+        con.execute("DELETE FROM strategies WHERE model_id=?", (model_id,))
         con.commit()
     finally:
         con.close()
@@ -269,25 +304,25 @@ def delete_model(model_id: str):
             os.remove(bp)
 
 
-def save_roi_strategy(model_id: str, name: str, strategy: dict, bt: dict, roi_score: float,
-                       bets_df: pd.DataFrame = None) -> str:
-    """Sauvegarde une stratégie de mise (issue du bruteforce ROI ou de la
+def save_selection_rule(model_id: str, name: str, strategy: dict, bt: dict, roi_score: float,
+                         bets_df: pd.DataFrame = None) -> str:
+    """Sauvegarde une règle de sélection (issue du bruteforce ROI ou de la
     simulation manuelle) associée à un modèle déjà sauvegardé."""
-    strat_id = uuid.uuid4().hex[:12]
+    rule_id = uuid.uuid4().hex[:12]
     bets_path = ""
     if bets_df is not None and not bets_df.empty:
-        bets_path = os.path.join(MODELS_DIR, f"roistrat_{strat_id}_bets.parquet")
+        bets_path = os.path.join(MODELS_DIR, f"rule_{rule_id}_bets.parquet")
         bets_df.to_parquet(bets_path, index=False)
 
     con = _connect()
     try:
         con.execute(
-            """INSERT INTO roi_strategies (
+            """INSERT INTO selection_rules (
                 id, model_id, name, strategy_json, n_bets, roi, total_profit, win_rate,
                 final_bankroll, max_drawdown, roi_score, created_at, bets_path
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                strat_id, model_id, name, json.dumps(strategy),
+                rule_id, model_id, name, json.dumps(strategy),
                 int(bt["n_bets"]), bt["roi"], bt["total_profit"], bt["win_rate"],
                 bt["final_bankroll"], bt["max_drawdown"], roi_score,
                 datetime.now(timezone.utc).isoformat(), bets_path,
@@ -296,38 +331,153 @@ def save_roi_strategy(model_id: str, name: str, strategy: dict, bt: dict, roi_sc
         con.commit()
     finally:
         con.close()
-    return strat_id
+    return rule_id
 
 
-def list_roi_strategies(model_id: str = None) -> pd.DataFrame:
+def list_selection_rules(model_id: str = None) -> pd.DataFrame:
     con = _connect()
     try:
         if model_id:
             df = pd.read_sql(
-                "SELECT * FROM roi_strategies WHERE model_id=? ORDER BY created_at DESC", con, params=(model_id,)
+                "SELECT * FROM selection_rules WHERE model_id=? ORDER BY created_at DESC", con, params=(model_id,)
             )
         else:
-            df = pd.read_sql("SELECT * FROM roi_strategies ORDER BY created_at DESC", con)
+            df = pd.read_sql("SELECT * FROM selection_rules ORDER BY created_at DESC", con)
     finally:
         con.close()
     return df
 
 
-def load_roi_strategy_bets(strategy_id: str) -> pd.DataFrame:
-    df = list_roi_strategies()
-    row = df[df.id == strategy_id]
+def load_selection_rule_bets(rule_id: str) -> pd.DataFrame:
+    df = list_selection_rules()
+    row = df[df.id == rule_id]
     if row.empty or not row.iloc[0]["bets_path"]:
         return pd.DataFrame()
     return pd.read_parquet(row.iloc[0]["bets_path"])
 
 
-def delete_roi_strategy(strategy_id: str):
+def delete_selection_rule(rule_id: str):
+    """Supprime la règle ET, en cascade, les stratégies (onglet 🎯 Stratégies)
+    qui la référencent (une stratégie n'a aucun sens sans sa règle)."""
     con = _connect()
     try:
-        row = con.execute("SELECT bets_path FROM roi_strategies WHERE id=?", (strategy_id,)).fetchone()
-        con.execute("DELETE FROM roi_strategies WHERE id=?", (strategy_id,))
+        row = con.execute("SELECT bets_path FROM selection_rules WHERE id=?", (rule_id,)).fetchone()
+        con.execute("DELETE FROM selection_rules WHERE id=?", (rule_id,))
+        con.execute("DELETE FROM strategies WHERE rule_id=?", (rule_id,))
         con.commit()
     finally:
         con.close()
     if row and row[0] and os.path.exists(row[0]):
         os.remove(row[0])
+
+
+def rename_selection_rule(rule_id: str, new_name: str):
+    con = _connect()
+    try:
+        con.execute("UPDATE selection_rules SET name=? WHERE id=?", (new_name, rule_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_selection_rule(rule_id: str, strategy: dict, bt: dict, roi_score: float,
+                           bets_df: pd.DataFrame = None):
+    """Remplace la config de mise et les métriques d'une règle de sélection déjà
+    sauvegardée (même id, donc conserve les stratégies qui la référencent) —
+    utilisé par le bouton 'Éditer' de l'onglet 🎯 Stratégies."""
+    existing = list_selection_rules()
+    existing = existing[existing.id == rule_id]
+    bets_path = existing.iloc[0]["bets_path"] if not existing.empty else ""
+    if bets_df is not None and not bets_df.empty:
+        bets_path = bets_path or os.path.join(MODELS_DIR, f"rule_{rule_id}_bets.parquet")
+        bets_df.to_parquet(bets_path, index=False)
+
+    con = _connect()
+    try:
+        con.execute(
+            """UPDATE selection_rules SET
+                strategy_json=?, n_bets=?, roi=?, total_profit=?, win_rate=?,
+                final_bankroll=?, max_drawdown=?, roi_score=?, bets_path=?
+               WHERE id=?""",
+            (
+                json.dumps(strategy), int(bt["n_bets"]), bt["roi"], bt["total_profit"], bt["win_rate"],
+                bt["final_bankroll"], bt["max_drawdown"], roi_score, bets_path, rule_id,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def create_strategy(name: str, model_id: str, rule_id: str) -> str:
+    """Crée une 'stratégie' (onglet 🎯 Stratégies): association explicite entre
+    un modèle sauvegardé et une de ses règles de sélection sauvegardées.
+    Contrairement aux règles elles-mêmes (bruteforce/simulation manuelle,
+    table selection_rules), cette table est vide par défaut — c'est
+    l'utilisateur qui crée chaque association à la main."""
+    strategy_id = uuid.uuid4().hex[:12]
+    con = _connect()
+    try:
+        con.execute(
+            "INSERT INTO strategies (id, name, model_id, rule_id, created_at) VALUES (?,?,?,?,?)",
+            (strategy_id, name, model_id, rule_id, datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return strategy_id
+
+
+def list_strategies() -> pd.DataFrame:
+    """Liste les stratégies créées par l'utilisateur, avec les caractéristiques
+    du modèle et de la règle de sélection associés jointes — pour l'onglet
+    🎯 Stratégies."""
+    con = _connect()
+    try:
+        df = pd.read_sql(
+            """
+            SELECT
+                st.id AS id, st.name AS name, st.created_at,
+                m.id AS model_id, m.name AS model_name, m.algo,
+                m.auc, m.logloss, m.brier, m.ece,
+                r.id AS rule_id, r.name AS rule_name, r.strategy_json,
+                r.n_bets, r.roi, r.total_profit, r.win_rate, r.final_bankroll, r.max_drawdown, r.roi_score
+            FROM strategies st
+            JOIN saved_models m ON m.id = st.model_id
+            JOIN selection_rules r ON r.id = st.rule_id
+            ORDER BY st.created_at DESC
+            """,
+            con,
+        )
+    finally:
+        con.close()
+    return df
+
+
+def rename_strategy(strategy_id: str, new_name: str):
+    con = _connect()
+    try:
+        con.execute("UPDATE strategies SET name=? WHERE id=?", (new_name, strategy_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def update_strategy(strategy_id: str, model_id: str, rule_id: str):
+    """Change le modèle et/ou la règle de sélection pointés par cette
+    stratégie (bouton 'Éditer' de l'onglet 🎯 Stratégies)."""
+    con = _connect()
+    try:
+        con.execute("UPDATE strategies SET model_id=?, rule_id=? WHERE id=?", (model_id, rule_id, strategy_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def delete_strategy(strategy_id: str):
+    con = _connect()
+    try:
+        con.execute("DELETE FROM strategies WHERE id=?", (strategy_id,))
+        con.commit()
+    finally:
+        con.close()

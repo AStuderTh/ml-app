@@ -25,26 +25,43 @@ ELO_DECAY_HALF_LIFE_DAYS = 365.0
 SURFACE_FEATURE = "surface"
 SURFACE_DUMMY_COLS = ["surface_clay", "surface_grass", "surface_hard"]
 
+# Même mécanique que SURFACE_FEATURE (un seul choix dans l'UI/le bruteforce,
+# développé en one-hot juste avant l'entraînement). Catégorie de référence
+# implicite: 'A', les ATP 250/500, de loin la plus fréquente.
+LEVEL_FEATURE = "tourney_level"
+LEVEL_DUMMY_COLS = ["level_grandslam", "level_masters", "level_finals"]
+
+# Statuts tennis-data.co ne correspondant à aucun match réellement disputé:
+# les paris y sont annulés par les bookmakers, il n'y a donc rien à prédire.
+NOT_PLAYED_COMMENTS = {"Walkover", "Awarded", "Disqualified", "Sched"}
+RETIRED_COMMENT = "Retired"
+
 # Pool de features candidates pour le constructeur manuel / le bruteforce.
-# Convention: une valeur positive favorise p1.
+# Convention: une valeur positive favorise p1 (pour les features
+# différentielles; les indicateurs de contexte ci-dessous décrivent le match
+# lui-même et n'avantagent aucun des deux joueurs).
 FEATURE_POOL = [
     "elo_diff", "elo_surface_diff", "elo_diff_recent", "elo_surface_diff_recent",
     "rank_diff", "rank_points_diff",
     "age_diff", "ht_diff", "form_diff", "h2h_diff",
     "hand_advantage", "implied_prob_p1", "experience_diff", SURFACE_FEATURE,
+    LEVEL_FEATURE, "best_of_5",
 ]
 
 
 def expand_features(features):
-    """Développe le pseudo-feature 'surface' en ses 3 colonnes one-hot
-    réelles. À appeler juste avant d'indexer un DataFrame de features (train,
-    backtest, prédiction live) — jamais avant, pour que le tirage aléatoire du
-    bruteforce et l'affichage des cases à cocher traitent 'surface' comme un
-    seul choix cohérent plutôt que 3 cases indépendantes."""
+    """Développe les pseudo-features catégorielles ('surface', 'tourney_level')
+    en leurs colonnes one-hot réelles. À appeler juste avant d'indexer un
+    DataFrame de features (train, backtest, prédiction live) — jamais avant,
+    pour que le tirage aléatoire du bruteforce et l'affichage des cases à
+    cocher traitent chacune comme un seul choix cohérent plutôt que comme
+    plusieurs cases indépendantes."""
     out = []
     for f in features:
         if f == SURFACE_FEATURE:
             out.extend(SURFACE_DUMMY_COLS)
+        elif f == LEVEL_FEATURE:
+            out.extend(LEVEL_DUMMY_COLS)
         else:
             out.append(f)
     return out
@@ -149,8 +166,17 @@ def build_training_frame(df_with_chrono: pd.DataFrame, odds_w_col: str, odds_l_c
     """Filtre aux matchs avec cotes disponibles sur la période demandée, puis
     ré-attribue aléatoirement gagnant/perdant à p1/p2 (seed fixe -> résultat
     reproductible d'un run à l'autre) pour que le label ne soit pas toujours
-    "p1 gagne"."""
+    "p1 gagne".
+
+    Les rencontres jamais disputées (forfait, match donné sur tapis vert) sont
+    écartées d'office: il n'y a pas de tennis à prédire et les bookmakers y
+    annulent les paris, elles ne feraient qu'ajouter du bruit d'étiquette. Les
+    abandons en cours de match, eux, sont conservés — un vainqueur a bien été
+    désigné et les paris sont généralement réglés — mais restent identifiables
+    via la colonne `match_comment` pour qui veut les exclure aussi."""
     sub = df_with_chrono.dropna(subset=[odds_w_col, odds_l_col, "surface"]).copy()
+    if "match_comment" in sub.columns:
+        sub = sub[~sub["match_comment"].isin(NOT_PLAYED_COMMENTS)]
     if min_date is not None:
         sub = sub[sub["tourney_date"] >= pd.Timestamp(min_date)]
     if max_date is not None:
@@ -210,6 +236,18 @@ def build_training_frame(df_with_chrono: pd.DataFrame, odds_w_col: str, odds_l_c
     out["surface_clay"] = (sub["surface"] == "Clay").astype(int).values
     out["surface_grass"] = (sub["surface"] == "Grass").astype(int).values
     out["surface_hard"] = (sub["surface"] == "Hard").astype(int).values
+
+    # Contexte du match. NaN (et non 0) quand l'info manque, pour que le
+    # dropna par modèle de train.py écarte ces lignes au lieu de les faire
+    # passer en douce pour la catégorie de référence.
+    lvl, bo = sub["tourney_level"], sub["best_of"]
+    lvl_known, bo_known = lvl.notna().values, bo.notna().values
+    out["level_grandslam"] = np.where(lvl_known, (lvl == "G").astype(float).values, np.nan)
+    out["level_masters"] = np.where(lvl_known, (lvl == "M").astype(float).values, np.nan)
+    out["level_finals"] = np.where(lvl_known, (lvl == "F").astype(float).values, np.nan)
+    out["best_of_5"] = np.where(bo_known, (bo == 5).astype(float).values, np.nan)
+    if "match_comment" in sub.columns:
+        out["match_comment"] = sub["match_comment"].values
     out["rank_diff"] = rank_p2 - rank_p1  # positif => p1 mieux classé
     out["rank_points_diff"] = pts_p1 - pts_p2
     out["age_diff"] = age_p1 - age_p2

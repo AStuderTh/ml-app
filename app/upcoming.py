@@ -10,7 +10,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from app import store
+from app import odds_log, store
+from app.backtest import DEFAULT_STRATEGY
 from app.live_match import (
     FEATURE_LABELS, build_live_features, compute_current_player_state,
     player_snapshot, resolve_player,
@@ -28,6 +29,12 @@ ODDS_PROVIDERS = {
 
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
 DISPLAY_TZ = "Europe/Paris"
+
+# Mise en valeur d'une opportunité de pari dans le tableau: seules les propriétés
+# CSS de couleur d'un Styler pandas sont interprétées par st.dataframe (les autres,
+# comme font-weight, sont ignorées sans erreur). Vert semi-transparent pour rester
+# lisible en thème clair comme en thème sombre.
+SIGNAL_CSS = "background-color: rgba(33, 195, 84, 0.28); font-weight: 600;"
 
 
 def _fetch_week(date: dt.date) -> dict:
@@ -121,6 +128,130 @@ def _implied_prob_from_row(row) -> float | None:
     return None
 
 
+def _signal_odds_from_row(row) -> tuple[float | None, float | None, str | None]:
+    """Cotes servant à DÉCIDER de parier: bookmaker uniquement (The Odds API,
+    puis odds-api.io). Volontairement PAS de repli Polymarket ici — le seuil
+    d'edge de la règle de sélection a été calibré en backtest contre des cotes
+    bookmaker, qui incluent une marge (surround ~5%); les probabilités
+    Polymarket sont, elles, quasi normalisées (somme ~1, pas de marge), donc
+    le même seuil appliqué à Polymarket ne sélectionne pas la même population
+    de paris que celle mesurée en backtest. Cotes BRUTES (non dévigorisées),
+    comme dans app.backtest.run_backtest."""
+    for o1_col, o2_col, label in (
+        ("cote_j1", "cote_j2", "The Odds API"),
+        ("oio_j1", "oio_j2", "odds-api.io"),
+    ):
+        o1, o2 = row.get(o1_col), row.get(o2_col)
+        if pd.notna(o1) and pd.notna(o2) and o1 > 1 and o2 > 1:
+            return float(o1), float(o2), label
+    return None, None, None
+
+
+def _polymarket_odds_from_row(row) -> tuple[float | None, float | None]:
+    """Cotes décimales équivalentes Polymarket (1/prix du marché), pour
+    l'EXÉCUTION du pari une fois qu'un signal bookmaker existe. `outcomePrices`
+    de la Gamma API est un prix de marché (mid), pas un carnet d'ordres: la
+    cote réellement obtenue à l'achat sera légèrement moins bonne (spread /
+    slippage), ces cotes sont donc indicatives."""
+    p1, p2 = row.get("pm_prob_j1"), row.get("pm_prob_j2")
+    if pd.notna(p1) and pd.notna(p2) and 0 < float(p1) < 1 and 0 < float(p2) < 1:
+        return 1.0 / float(p1), 1.0 / float(p2)
+    return None, None
+
+
+def _attach_bet_signals(sub: pd.DataFrame, strategy: dict) -> pd.DataFrame:
+    """Applique la règle de sélection de la stratégie choisie (edge_threshold,
+    stake_mode, kelly_fraction) aux probabilités du modèle pour marquer les
+    opportunités de pari sur les matchs à venir — transposition exacte de la
+    logique de sélection de app.backtest.run_backtest, pour que le signal
+    affiché ici corresponde à ce qui a été mesuré en backtest.
+
+    La DÉCISION (parier ou non, et sur qui) se prend exclusivement sur les
+    cotes bookmaker — seule source contre laquelle le seuil d'edge a été
+    validé. L'EXÉCUTION est ensuite routée vers le marché qui offre la
+    meilleure cote pour ce même joueur (bookmaker ou Polymarket): une cote
+    plus haute sur le pari déjà décidé ne fait qu'augmenter le gain, elle ne
+    change pas la population de paris sélectionnée, donc le ROI du backtest
+    reste un plancher.
+
+    Ajoute bet_side ('j1'/'j2'/None), bet_edge/bet_odds/bet_source (le signal,
+    côté bookmaker), exec_odds/exec_venue/exec_gain (où miser réellement) et
+    bet_stake. Reste vide si la probabilité du modèle est indisponible ou si
+    aucun bookmaker ne couvre le match."""
+    sub = sub.copy()
+    for col in ("bet_side", "bet_source", "exec_venue"):
+        sub[col] = None
+    for col in ("bet_edge", "bet_odds", "exec_odds", "exec_gain", "bet_stake"):
+        sub[col] = pd.NA
+    if not strategy:
+        return sub
+
+    strat = {**DEFAULT_STRATEGY, **strategy}
+    for i, row in sub.iterrows():
+        model_p1 = row["model_prob_j1"]
+        if pd.isna(model_p1):
+            continue
+        o1, o2, source = _signal_odds_from_row(row)
+        if o1 is None:
+            continue
+
+        model_p1 = float(model_p1)
+        model_p2 = 1.0 - model_p1
+        edge_1, edge_2 = model_p1 - 1.0 / o1, model_p2 - 1.0 / o2
+        if edge_1 >= strat["edge_threshold"] and edge_1 >= edge_2:
+            side, edge, odds, p = "j1", edge_1, o1, model_p1
+        elif edge_2 >= strat["edge_threshold"]:
+            side, edge, odds, p = "j2", edge_2, o2, model_p2
+        else:
+            continue
+
+        # Routage de l'exécution: on ne compare que le côté effectivement joué
+        # (l'autre côté ne sera pas misé, sa cote n'a aucune importance).
+        exec_odds, exec_venue = odds, source
+        pm_o1, pm_o2 = _polymarket_odds_from_row(row)
+        if pm_o1 is not None:
+            pm_odds = pm_o1 if side == "j1" else pm_o2
+            if pm_odds > exec_odds:
+                exec_odds, exec_venue = pm_odds, "Polymarket"
+
+        if strat["stake_mode"] == "kelly":
+            # Kelly calculé sur la cote réellement obtenue (exec_odds): c'est ce
+            # payout-là qui détermine la mise optimale. Bankroll = celle de la
+            # stratégie (valeur de départ du backtest), aucune bankroll réelle
+            # n'étant suivie ici — la mise reste donc indicative.
+            b = exec_odds - 1.0
+            f = ((p * b - (1 - p)) / b) if b > 0 else 0.0
+            stake = strat["bankroll"] * max(0.0, min(f * (strat["kelly_fraction"] or 0.0), 1.0))
+        else:
+            stake = strat["flat_stake"]
+        if stake <= 0:
+            continue
+
+        sub.loc[i, "bet_side"] = side
+        sub.loc[i, "bet_edge"] = edge
+        sub.loc[i, "bet_odds"] = odds
+        sub.loc[i, "bet_source"] = source
+        sub.loc[i, "exec_odds"] = exec_odds
+        sub.loc[i, "exec_venue"] = exec_venue
+        sub.loc[i, "exec_gain"] = exec_odds / odds - 1.0
+        sub.loc[i, "bet_stake"] = stake
+    return sub
+
+
+def _style_signals(display: pd.DataFrame, sides: pd.Series):
+    """Colore en vert la case du joueur sur lequel la stratégie envoie un signal
+    de pari (et la case '🎯 Pari' de la même ligne). `sides` doit partager
+    l'index de `display` (les deux viennent du même `sub` réindexé)."""
+    css = pd.DataFrame("", index=display.index, columns=display.columns)
+    for i, side in sides.items():
+        if side not in ("j1", "j2"):
+            continue
+        for col in ("Joueur 1" if side == "j1" else "Joueur 2", "🎯 Pari"):
+            if col in css.columns:
+                css.loc[i, col] = SIGNAL_CSS
+    return display.style.apply(lambda _: css, axis=None)
+
+
 def _attach_model_predictions(sub: pd.DataFrame, model_row, state: dict) -> pd.DataFrame:
     """Ajoute model_prob_j1/model_prob_j2 (probabilité de victoire prédite
     par le modèle sauvegardé sélectionné au-dessus du tableau) à chaque
@@ -160,10 +291,50 @@ def _attach_model_predictions(sub: pd.DataFrame, model_row, state: dict) -> pd.D
     return sub
 
 
-def _render_match_detail(match: dict, dataset: pd.DataFrame, model_row=None):
+def _render_bet_signal(match: dict, strategy: dict, strategy_name: str = None):
+    """Bandeau de recommandation en tête du détail d'un match, à partir du
+    signal déjà calculé par _attach_bet_signals sur la ligne sélectionnée."""
+    if not strategy:
+        return
+    side = match.get("bet_side")
+    if side not in ("j1", "j2"):
+        st.info(
+            f"Aucun signal de pari sur ce match pour la stratégie **{strategy_name}** "
+            f"(edge insuffisant, probabilité du modèle non calculable, ou aucune cote "
+            f"bookmaker disponible — le signal ne se prend jamais sur Polymarket seul)."
+        )
+        return
+
+    player = match["joueur_1"] if side == "j1" else match["joueur_2"]
+    strat = {**DEFAULT_STRATEGY, **strategy}
+    if strat["stake_mode"] == "kelly":
+        stake_txt = (f"{match['bet_stake']:.2f} € — Kelly {strat['kelly_fraction']:.0%} "
+                     f"sur une bankroll de {strat['bankroll']:.0f} €")
+    else:
+        stake_txt = f"{match['bet_stake']:.2f} € (mise fixe)"
+
+    exec_line = f"**Où miser :** {match['exec_venue']} @ **{match['exec_odds']:.2f}**"
+    if match["exec_venue"] == "Polymarket":
+        gain = match["exec_gain"]
+        exec_line += (f" — soit **+{gain*100:.1f}% de gain** par rapport à la cote "
+                      f"{match['bet_source']} ({match['bet_odds']:.2f}) qui a déclenché le signal "
+                      f"(cote Polymarket indicative : prix de marché, hors spread)")
+    st.success(
+        f"🎯 **Opportunité — miser sur {player}**  \n"
+        f"**Signal :** edge **+{match['bet_edge']*100:.1f} pts** vs {match['bet_source']} "
+        f"@ {match['bet_odds']:.2f} (seuil de la stratégie : {strat['edge_threshold']*100:.1f} pts)  \n"
+        f"{exec_line}  \n"
+        f"**Mise conseillée :** {stake_txt}"
+    )
+
+
+def _render_match_detail(match: dict, dataset: pd.DataFrame, model_row=None,
+                          strategy: dict = None, strategy_name: str = None):
     st.divider()
     st.markdown(f"### 🔍 {match['joueur_1']} vs {match['joueur_2']}")
     st.caption(f"{match['tournoi']} — {match['round']} — {match['date_locale'].strftime('%a %d/%m %H:%M')}")
+
+    _render_bet_signal(match, strategy, strategy_name)
 
     if match["joueur_1"] == "TBD" or match["joueur_2"] == "TBD":
         st.info("Adversaires pas encore connus (tirage au sort pas encore sorti) — pas de stats possibles.")
@@ -398,21 +569,58 @@ def render_upcoming(dataset: pd.DataFrame = None):
         elif info:
             st.caption(info)
 
-    st.markdown("#### 🤖 Modèle pour les colonnes de prédiction")
+    st.markdown("#### 🎯 Stratégie / modèle appliqué aux matchs à venir")
     saved_models = store.list_models()
-    model_row = None
+    strategies_df = store.list_strategies()
+    model_row, strategy, strategy_name = None, None, None
+
     if saved_models.empty:
         st.caption(
             "Aucun modèle sauvegardé — entraîne et sauvegarde un modèle dans l'onglet "
             "'🛠️ Construire un modèle' pour afficher ses prédictions ici."
         )
     else:
-        model_labels = [f"{r['name']} ({r['algo']}, AUC {r['auc']:.3f})" for _, r in saved_models.iterrows()]
-        model_idx = st.selectbox(
-            "Modèle sauvegardé (probabilité/cote affichées dans le tableau et le détail d'un match)",
-            range(len(model_labels)), format_func=lambda i: model_labels[i], key="upc_model_select",
+        # Une stratégie (modèle + règle de sélection) permet en plus de signaler les
+        # opportunités de pari; un modèle seul n'affiche que ses probabilités.
+        choices = ([("strategy", r) for _, r in strategies_df.iterrows()]
+                   + [("model", r) for _, r in saved_models.iterrows()])
+
+        def _choice_label(idx):
+            kind, r = choices[idx]
+            if kind == "strategy":
+                strat = json.loads(r["strategy_json"])
+                return (f"🎯 {r['name']} — edge ≥ {strat.get('edge_threshold', 0)*100:.1f} pts, "
+                        f"{strat.get('stake_mode')} (ROI backtest {r['roi']*100:+.1f}%, {int(r['n_bets'])} paris)")
+            return f"🤖 {r['name']} ({r['algo']}, AUC {r['auc']:.3f}) — probabilités seules, sans signal"
+
+        choice_idx = st.selectbox(
+            "Stratégie (🎯 = signaux de pari mis en valeur) ou modèle seul (🤖)",
+            range(len(choices)), format_func=_choice_label, key="upc_strategy_select",
         )
-        model_row = saved_models.iloc[model_idx]
+        kind, chosen = choices[choice_idx]
+        if kind == "strategy":
+            model_row = saved_models[saved_models["id"] == chosen["model_id"]].iloc[0]
+            strategy = json.loads(chosen["strategy_json"])
+            strategy_name = chosen["name"]
+        else:
+            model_row = chosen
+
+        if strategies_df.empty:
+            st.caption(
+                "Aucune stratégie créée — associe un modèle à une règle de sélection dans l'onglet "
+                "'🎯 Stratégies' pour faire apparaître ici les opportunités de pari."
+            )
+        elif strategy is not None:
+            st.caption(
+                f"Modèle **{model_row['name']}** + règle **{chosen['rule_name']}**. "
+                "**Décision** : un pari est signalé (case du joueur en vert) quand la probabilité du "
+                "modèle dépasse d'au moins le seuil d'edge celle impliquée par la **cote bookmaker** "
+                "— seule source contre laquelle la règle a été validée en backtest, Polymarket n'est "
+                "jamais utilisé pour décider. **Exécution** : la colonne '🛒 Où miser' route ensuite le "
+                "pari vers le marché offrant la meilleure cote pour ce joueur, souvent Polymarket "
+                "(pas de marge bookmaker). Miser plus haut sur un pari déjà décidé ne peut qu'améliorer "
+                "le résultat : le ROI du backtest reste un plancher."
+            )
 
     state = compute_current_player_state(dataset) if (model_row is not None and dataset is not None) else None
 
@@ -426,7 +634,29 @@ def render_upcoming(dataset: pd.DataFrame = None):
             return "—"
         return f"{v*100:.1f}% ({1/v:.2f})"
 
+    def _fmt_book(o1, o2):
+        """Cote bookmaker affichée avec la probabilité de victoire qu'elle
+        implique. La probabilité est DÉVIGORISÉE (répartie au prorata sur les
+        deux joueurs, donc somme = 100%): l'inverse brut de la cote inclut la
+        marge du bookmaker et les deux côtés sommeraient à ~105%, ce qui
+        surestimerait les deux joueurs à la fois et ne serait pas comparable à
+        la colonne Polymarket, qui est elle nativement sans marge. La cote
+        brute reste affichée entre parenthèses: c'est elle qui détermine le
+        gain, et c'est elle qui sert au calcul du signal (cf. _signal_odds_from_row)."""
+        if pd.isna(o1) or pd.isna(o2) or o1 <= 1 or o2 <= 1:
+            return _fmt_decimal(o1)
+        i1, i2 = 1.0 / float(o1), 1.0 / float(o2)
+        return f"{i1/(i1+i2)*100:.1f}% ({float(o1):.2f})"
+
     selected_match = None
+    signal_banner = st.empty()  # rempli après la boucle: total d'opportunités tous tournois confondus
+    total_signals = 0
+    total_pm_exec = 0  # parmi elles, celles à exécuter sur Polymarket (meilleure cote)
+
+    # Journal des prix: lu ICI (avant la boucle) depuis session_state car le
+    # widget qui le pilote est rendu en bas de page, après les tableaux.
+    log_prices = st.session_state.get("upc_log_prices", True)
+    n_logged = 0
 
     for tourney in tournois:
         sub = df[df["tournoi"] == tourney].reset_index(drop=True)
@@ -434,13 +664,52 @@ def render_upcoming(dataset: pd.DataFrame = None):
             continue
         sub["surface"] = _guess_surface(tourney, dataset) if dataset is not None else None
         sub = _attach_model_predictions(sub, model_row, state)
-        with st.expander(f"🏆 {tourney} ({len(sub)} matchs)", expanded=len(sub) <= 20):
+        sub = _attach_bet_signals(sub, strategy)
+        n_signals = int(sub["bet_side"].notna().sum())
+        total_signals += n_signals
+        total_pm_exec += int((sub["exec_venue"] == "Polymarket").sum())
+
+        if log_prices:
+            n_logged += odds_log.log_snapshots(
+                sub, _signal_odds_from_row,
+                model_id=model_row["id"] if model_row is not None else None,
+            )
+
+        title = f"🏆 {tourney} ({len(sub)} matchs)"
+        if n_signals:
+            title += f" — 🎯 {n_signals} opportunité{'s' if n_signals > 1 else ''}"
+        with st.expander(title, expanded=len(sub) <= 20 or n_signals > 0):
             display = sub.copy()
             display["Date"] = display["date_locale"].dt.strftime("%a %d/%m %H:%M")
             display["surface"] = display["surface"].fillna("?")
-            cols = ["Date", "round", "joueur_1", "joueur_2", "surface", "lieu"]
+            cols = ["Date", "round", "joueur_1", "joueur_2"]
             rename = {"round": "Round", "joueur_1": "Joueur 1", "joueur_2": "Joueur 2",
                       "surface": "Surface", "lieu": "Lieu"}
+
+            # Colonnes du signal placées juste après les joueurs: c'est l'info la
+            # plus actionnable du tableau, elle ne doit pas demander de scroller.
+            if strategy is not None:
+                display["signal_player"] = sub.apply(
+                    lambda r: "—" if r["bet_side"] not in ("j1", "j2")
+                    else f"✅ {r['joueur_1'] if r['bet_side'] == 'j1' else r['joueur_2']}", axis=1,
+                )
+                display["signal_edge"] = sub["bet_edge"].apply(
+                    lambda e: f"+{e*100:.1f} pts" if pd.notna(e) else "—")
+                display["signal_odds"] = sub["bet_odds"].apply(_fmt_decimal)
+                display["exec_venue"] = sub.apply(
+                    lambda r: "—" if pd.isna(r["exec_odds"])
+                    else (f"📊 Polymarket {r['exec_odds']:.2f} (+{r['exec_gain']*100:.1f}%)"
+                          if r["exec_venue"] == "Polymarket" else f"💰 {r['exec_venue']} {r['exec_odds']:.2f}"),
+                    axis=1,
+                )
+                display["signal_stake"] = sub["bet_stake"].apply(
+                    lambda s: f"{s:.2f}" if pd.notna(s) else "—")
+                cols += ["signal_player", "signal_edge", "signal_odds", "exec_venue", "signal_stake"]
+                rename.update({"signal_player": "🎯 Pari", "signal_edge": "Edge (signal)",
+                               "signal_odds": "Cote signal", "exec_venue": "🛒 Où miser",
+                               "signal_stake": "Mise"})
+
+            cols += ["surface", "lieu"]
 
             # Polymarket: toujours affiché
             display["pm_j1"] = display["pm_prob_j1"].apply(_fmt_pm)
@@ -448,16 +717,22 @@ def render_upcoming(dataset: pd.DataFrame = None):
             cols += ["pm_j1", "pm_j2"]
             rename.update({"pm_j1": "Polymarket J1", "pm_j2": "Polymarket J2"})
 
+            # Cotes bookmaker: même format que Polymarket (proba % + cote), pour
+            # que les deux marchés se comparent d'un coup d'œil sur la ligne.
             if provider == "the_odds_api":
-                display["cote_j1"] = display["cote_j1"].apply(_fmt_decimal)
-                display["cote_j2"] = display["cote_j2"].apply(_fmt_decimal)
-                cols += ["cote_j1", "cote_j2"]
-                rename.update({"cote_j1": "Cote J1 (TOA)", "cote_j2": "Cote J2 (TOA)"})
+                book_j1, book_j2 = "cote_j1", "cote_j2"
+                book_label = "TOA"
             elif provider == "odds_api_io":
-                display["oio_j1"] = display["oio_j1"].apply(_fmt_decimal)
-                display["oio_j2"] = display["oio_j2"].apply(_fmt_decimal)
-                cols += ["oio_j1", "oio_j2"]
-                rename.update({"oio_j1": "Cote J1 (odds.io)", "oio_j2": "Cote J2 (odds.io)"})
+                book_j1, book_j2 = "oio_j1", "oio_j2"
+                book_label = "odds.io"
+            else:
+                book_j1 = None
+
+            if book_j1:
+                display["book_j1"] = sub.apply(lambda r: _fmt_book(r[book_j1], r[book_j2]), axis=1)
+                display["book_j2"] = sub.apply(lambda r: _fmt_book(r[book_j2], r[book_j1]), axis=1)
+                cols += ["book_j1", "book_j2"]
+                rename.update({"book_j1": f"💰 {book_label} J1", "book_j2": f"💰 {book_label} J2"})
 
             if model_row is not None:
                 display["model_j1"] = display["model_prob_j1"].apply(_fmt_pm)
@@ -466,14 +741,85 @@ def render_upcoming(dataset: pd.DataFrame = None):
                 rename.update({"model_j1": f"🤖 {model_row['name']} J1", "model_j2": f"🤖 {model_row['name']} J2"})
 
             display = display[cols].rename(columns=rename)
+            table = _style_signals(display, sub["bet_side"]) if n_signals else display
 
             event = st.dataframe(
-                display, width="stretch", hide_index=True,
+                table, width="stretch", hide_index=True,
                 on_select="rerun", selection_mode="single-row", key=f"upc_table_{tourney}",
             )
             rows = event.selection.rows if event and event.selection else []
             if rows:
                 selected_match = sub.iloc[rows[0]].to_dict()
 
+    if strategy is not None:
+        if total_signals:
+            plural = "s" if total_signals > 1 else ""
+            routing = ""
+            if total_pm_exec:
+                routing = (f" Dont **{total_pm_exec}** à exécuter sur **Polymarket** plutôt que chez le "
+                           f"bookmaker (cote plus élevée pour le même pari).")
+            signal_banner.success(
+                f"🎯 **{total_signals} opportunité{plural} de pari** détectée{plural} par la stratégie "
+                f"**{strategy_name}** sur la période — joueur à jouer surligné en vert dans les tableaux "
+                f"ci-dessous.{routing}"
+            )
+        elif provider is None:
+            signal_banner.warning(
+                "Aucun fournisseur de cotes bookmaker sélectionné : la décision de pari se prend "
+                "uniquement sur les cotes bookmaker, aucun signal ne peut donc être calculé. "
+                "Choisis 'The Odds API' ou 'odds-api.io' dans le menu 'Fournisseur de cotes' ci-dessus."
+            )
+        else:
+            signal_banner.info(
+                f"Aucune opportunité détectée par la stratégie **{strategy_name}** sur la période : "
+                "soit aucun match n'atteint le seuil d'edge, soit les cotes bookmaker/probabilités du "
+                "modèle manquent encore (le marché n'ouvre que quelques jours avant le tournoi)."
+            )
+
     if selected_match is not None:
-        _render_match_detail(selected_match, dataset, model_row)
+        _render_match_detail(selected_match, dataset, model_row, strategy, strategy_name)
+
+    _render_price_log_panel(n_logged)
+
+
+def _render_price_log_panel(n_logged: int):
+    """Pilotage et état du journal des prix (cf. app.odds_log): c'est lui qui
+    construit, jour après jour, l'historique Polymarket dont on ne dispose pas
+    et sans lequel aucun signal Polymarket-only ne peut être validé."""
+    with st.expander("📝 Journal des prix de marché (constitution de l'historique Polymarket)"):
+        st.checkbox(
+            "Enregistrer les prix des matchs affichés", value=True, key="upc_log_prices",
+            help="Un instantané par match et par heure de consultation, au maximum.",
+        )
+        st.caption(
+            "Aucun historique Polymarket n'est disponible publiquement, alors que l'historique "
+            "bookmaker couvre des années (data/tennis.db). C'est ce qui empêche aujourd'hui de "
+            "valider un signal sur les matchs que **seul** Polymarket couvre : ils sont absents "
+            "du backtest, qui ne retient que les matchs cotés par un bookmaker. Ce journal "
+            "enregistre à chaque consultation le prix Polymarket **et** la cote bookmaker du "
+            "moment, pour reconstituer cet historique. Une fois les résultats connus, les matchs "
+            "couverts par les deux sources permettent de mesurer directement l'écart entre "
+            "Polymarket et le consensus bookmaker dévigorisé, et les matchs Polymarket-only "
+            "deviennent enfin backtestables."
+        )
+
+        s = odds_log.stats()
+        if not s["n_snapshots"]:
+            st.info("Journal vide pour l'instant — il se remplira à chaque consultation de cet onglet.")
+            return
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Instantanés", f"{s['n_snapshots']:,}".replace(",", " "))
+        m2.metric("Matchs suivis", s["n_matches"])
+        m3.metric("Polymarket + bookmaker", s["n_both"], help="Comparables entre eux — calibration du biais.")
+        m4.metric("Polymarket seul", s["n_pm_only"], help="La population aujourd'hui non backtestable.")
+        if n_logged:
+            st.caption(f"➕ {n_logged} instantané(s) ajouté(s) à l'instant.")
+        if s["since"]:
+            st.caption(f"Collecte démarrée le {s['since'][:10]}.")
+
+        snaps = odds_log.load_snapshots()
+        st.download_button(
+            "⬇️ Exporter le journal (CSV)", snaps.to_csv(index=False).encode("utf-8"),
+            file_name="odds_log.csv", mime="text/csv",
+        )

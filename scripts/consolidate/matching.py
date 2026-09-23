@@ -126,6 +126,33 @@ def match_with_tennisdata(fused: pd.DataFrame, td: pd.DataFrame) -> MatchResult:
     td_tourneys = td.groupby(["year", "tourney_name_norm"]).size().reset_index()[["year", "tourney_name_norm"]]
     fused_tourneys = fused.groupby(["year", "tourney_name_norm"]).size().reset_index()[["year", "tourney_name_norm"]]
 
+    # Empreintes par instance de tournoi: date de début + plateau engagé. Le
+    # recouvrement des joueurs est un signal bien plus robuste que le nom: il
+    # survit à n'importe quel changement de sponsor (sans quoi TOURNEY_ALIASES
+    # doit être complété à la main pour chaque nouveau nom commercial), alors
+    # que deux tournois distincts ont des plateaux disjoints.
+    f_start = fused.groupby(["year", "tourney_name_norm"])["tourney_date"].min()
+    t_start = td.groupby(["year", "tourney_name_norm"])["Date"].min()
+    f_players = fused.groupby(["year", "tourney_name_norm"]).apply(
+        lambda g: set(g["wn"].map(nm.surname_guess)) | set(g["ln"].map(nm.surname_guess))
+    )
+    t_players = td.groupby(["year", "tourney_name_norm"]).apply(
+        lambda g: set(g["w_surname"]) | set(g["l_surname"])
+    )
+
+    def _player_overlap(fkey, tkey):
+        """Similarité de plateau (Jaccard) entre deux instances de tournoi.
+
+        Jaccard et non coefficient de recouvrement: ce dernier vaut ~1 dès
+        qu'un petit tournoi est inclus dans un gros, or les ATP 250 de la
+        semaine précédant un Grand Chelem ont justement un plateau
+        entièrement réengagé ensuite (Nice/Genève avant Roland-Garros) — ils
+        écrasaient donc la marge exigée sur le 2e meilleur candidat."""
+        a, b = f_players.get(fkey), t_players.get(tkey)
+        if not a or not b:
+            return 0.0
+        return len(a & b) / len(a | b)
+
     tourney_link = {}  # (year, td_name_norm) -> (year, fused_name_norm)
     fused_exact = set(map(tuple, fused_tourneys.values.tolist()))
     for year, td_name in td_tourneys.values.tolist():
@@ -138,15 +165,32 @@ def match_with_tennisdata(fused: pd.DataFrame, td: pd.DataFrame) -> MatchResult:
         # Open' vs 'Australian Hardcourt Championships') ne doivent jamais
         # se faire relier sur un score ambigu.
         same_year = fused_tourneys[fused_tourneys.year == year]
-        scored = sorted(
-            ((nm.tourney_name_similarity(td_name, cand), cand) for cand in same_year.tourney_name_norm),
-            reverse=True,
-        )
+        tkey = (year, td_name)
+        td_start = t_start.get(tkey)
+        scored = []
+        for cand in same_year.tourney_name_norm:
+            fkey = (year, cand)
+            score = nm.tourney_name_similarity(td_name, cand)
+            # le plateau n'est confronté que si les deux instances tombent la
+            # même semaine: sans cette garde, deux étapes successives d'une
+            # même tournée (plateaux très proches) pourraient se relier.
+            f_st = f_start.get(fkey)
+            if td_start is not None and f_st is not None and abs((f_st - td_start).days) <= 10:
+                score = max(score, _player_overlap(fkey, tkey))
+            scored.append((score, cand))
+        scored.sort(reverse=True)
         if not scored:
             continue
         best_score, best_name = scored[0]
         runner_up = scored[1][0] if len(scored) > 1 else 0.0
-        if best_score >= 0.72 and (best_score - runner_up) >= 0.12:
+        margin = best_score - runner_up
+        # deux régimes d'acceptation. Le nom seul reste exigeant (0.72). La
+        # preuve par le plateau tolère un score plus bas — les deux sources
+        # ne couvrent pas exactement les mêmes tours, ce qui plafonne le
+        # Jaccard d'un vrai couple autour de 0.7 — mais réclame en échange
+        # une marge nettement plus large sur le 2e candidat, qui lui reste
+        # sous 0.2 dès qu'il s'agit d'un autre tournoi.
+        if (best_score >= 0.72 and margin >= 0.12) or (best_score >= 0.5 and margin >= 0.30):
             tourney_link[(year, td_name)] = (year, best_name)
 
     fused_groups = fused.groupby(["year", "tourney_name_norm"]).groups

@@ -152,6 +152,34 @@ N_BETS_REF = 500                              # nombre de paris à partir duquel
 DRAWDOWN_FLOOR, DRAWDOWN_CEIL = 1.50, 0.05    # 150% de drawdown -> 0, 5% -> 1
 
 
+def compute_return_risk_ratio(bt: dict) -> dict:
+    """Rendement rapporté au capital de départ, et ratio rendement/risque façon
+    Calmar (rendement / drawdown max). Contrairement au ROI de run_backtest
+    (profit / total misé), le rendement ici est rapporté à la bankroll de
+    DÉPART: comparable entre stratégies flat et kelly même quand leur volume
+    misé (turnover) diffère énormément — kelly mise proportionnellement plus
+    au fil du temps car les mises grossissent avec la bankroll, ce qui dilue
+    son ROI% sans que ça reflète une moindre rentabilité réelle.
+    bankroll_initiale se déduit de final_bankroll - total_profit (pas besoin
+    de la stocker séparément)."""
+    total_profit = bt.get("total_profit", float("nan"))
+    final_bankroll = bt.get("final_bankroll", float("nan"))
+    max_dd = bt.get("max_drawdown", float("nan"))
+
+    bankroll_initial = final_bankroll - total_profit
+    if bankroll_initial != bankroll_initial or bankroll_initial <= 0:
+        return {"return_on_bankroll": float("nan"), "calmar_ratio": float("nan")}
+
+    return_on_bankroll = total_profit / bankroll_initial
+    if max_dd != max_dd or max_dd < 1e-4:
+        # Pas de drawdown mesurable: ratio non défini plutôt qu'une division
+        # par ~0 qui produirait un chiffre artificiellement énorme.
+        calmar_ratio = float("nan")
+    else:
+        calmar_ratio = return_on_bankroll / max_dd
+    return {"return_on_bankroll": return_on_bankroll, "calmar_ratio": calmar_ratio}
+
+
 def compute_roi_score(backtest_metrics: dict, weights: dict = None) -> dict:
     """Note composite 0-100 pour classer des stratégies de mise entre elles,
     sur un modèle fixe: récompense un ROI élevé, un nombre de paris suffisant
