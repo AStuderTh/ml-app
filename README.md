@@ -23,6 +23,8 @@ The application is intended for research and education. Backtest results are not
 
 The project does not require a pre-existing database, model, cache, or local data folder. Those files are generated at runtime and are intentionally excluded from Git.
 
+The scikit-learn version is pinned because saved Joblib models are version-sensitive. If you already have models created with another scikit-learn version, retrain them after installing the pinned dependencies instead of ignoring compatibility warnings.
+
 ## Installation
 
 ### Windows PowerShell

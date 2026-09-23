@@ -15,9 +15,11 @@ Appelé aussi depuis l'app Streamlit (onglet "Données") via `run_update`,
 qui accepte un callback `log` pour afficher la progression dans l'UI.
 """
 import datetime as dt
+from html.parser import HTMLParser
 import os
 import subprocess
 import sys
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -30,6 +32,43 @@ GIT_REPOS = {
     "TML-Database": "https://github.com/Tennismylife/TML-Database.git",
 }
 TENNISDATA_BASE_URL = "http://www.tennis-data.co.uk"
+TENNISDATA_CATALOG_URL = f"{TENNISDATA_BASE_URL}/data.php"
+
+
+class _TennisDataCatalogParser(HTMLParser):
+    """Extrait les liens de fichiers Excel depuis le catalogue officiel."""
+
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        href = dict(attrs).get("href")
+        if href:
+            self.links.append(href)
+
+
+def _catalog_urls(session, years):
+    response = session.get(
+        TENNISDATA_CATALOG_URL,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    parser = _TennisDataCatalogParser()
+    parser.feed(response.text)
+    urls = {}
+    for href in parser.links:
+        absolute_url = urljoin(TENNISDATA_CATALOG_URL, href)
+        path_parts = [part for part in urlparse(absolute_url).path.split("/") if part]
+        if len(path_parts) >= 2:
+            year, filename = path_parts[-2:]
+            if year in years and filename == f"{year}.xlsx":
+                urls[int(year)] = absolute_url
+    return urls
 
 
 def _log(msg, cb=None):
@@ -85,11 +124,19 @@ def download_tennisdata(years=None, log=None):
     out_dir = os.path.join(DATA_DIR, "tennis-data.co")
     os.makedirs(out_dir, exist_ok=True)
     results = {}
+    session = requests.Session()
+    try:
+        urls = _catalog_urls(session, {str(year) for year in years})
+    except Exception as e:
+        urls = {}
+        _log(f"  [catalogue tennis-data.co] ECHEC — {e}", log)
     for year in years:
-        url = f"{TENNISDATA_BASE_URL}/{year}/{year}.xlsx"
+        url = urls.get(year)
         dest = os.path.join(out_dir, f"{year}.xlsx")
         try:
-            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+            if url is None:
+                raise RuntimeError(f"lien ATP {year}.xlsx absent du catalogue")
+            resp = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
             resp.raise_for_status()
             with open(dest, "wb") as f:
                 f.write(resp.content)
