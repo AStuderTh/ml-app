@@ -178,7 +178,10 @@ def load_model_object(model_id: str):
     row = row[row.id == model_id]
     if row.empty:
         return None
-    return joblib.load(row.iloc[0]["model_path"])
+    model_path = row.iloc[0]["model_path"]
+    if not model_path or not os.path.isfile(model_path):
+        return None
+    return joblib.load(model_path)
 
 
 def load_test_frame_with_probs(model_id: str, dataset: pd.DataFrame, odds_w_col: str = None,
