@@ -5,10 +5,11 @@ sélectionné dans la liste pour afficher ses stats et une prédiction d'un
 modèle ML sauvegardé."""
 import datetime as dt
 import json
+import time
 
 import pandas as pd
-import requests
 import streamlit as st
+from curl_cffi import requests
 
 from app import bet_log, odds_log, store
 from app.backtest import DEFAULT_STRATEGY
@@ -38,40 +39,45 @@ SIGNAL_CSS = "background-color: rgba(33, 195, 84, 0.28); font-weight: 600;"
 
 
 def _fetch_week(date: dt.date) -> dict:
+    """`requests` (urllib3/OpenSSL) se fait bloquer en 403 par le WAF d'ESPN
+    même en appel isolé avec les bons headers HTTP — diagnostiqué comme un
+    blocage sur la signature TLS (JA3/JA4), différente d'un vrai navigateur
+    ou de curl. `curl_cffi` avec impersonate="chrome" reproduit cette
+    signature et passe le même test."""
     resp = requests.get(
         ESPN_SCOREBOARD_URL,
         params={"dates": date.strftime("%Y%m%d")},
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0.0.0 Safari/537.36"
-            ),
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer": "https://www.espn.com/",
-            "Origin": "https://www.espn.com",
         },
+        impersonate="chrome",
         timeout=20,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-@st.cache_data(ttl=300, show_spinner="Récupération du calendrier ATP (ESPN)...")
+@st.cache_data(ttl=1800, show_spinner="Récupération du calendrier ATP (ESPN)...")
 def get_upcoming_matches(days_ahead: int = 21) -> pd.DataFrame:
     """Interroge le scoreboard ESPN une fois par semaine sur la fenêtre demandée.
 
     Chaque réponse renvoie les événements actifs autour de la date demandée;
     un pas de 7 jours couvre les tournois hebdomadaires tout en évitant de
     déclencher les limites de requêtes d'ESPN. Les matchs simples pas encore
-    joués (status 'pre') sont dédupliqués par id ESPN.
+    joués (status 'pre') sont dédupliqués par id ESPN. Un court délai entre
+    chaque requête de la boucle évite d'envoyer une rafale de 4 requêtes
+    d'un coup, qui peut déclencher un cooldown temporaire côté ESPN/Akamai
+    même à volume total modeste (pattern plus suspect qu'un vrai navigateur).
     """
     today = dt.date.today()
     rows = {}
     errors = []
     successful_fetches = 0
-    for offset in range(0, days_ahead + 1, 7):
+    offsets = list(range(0, days_ahead + 1, 7))
+    for i, offset in enumerate(offsets):
+        if i > 0:
+            time.sleep(1.5)
         date = today + dt.timedelta(days=offset)
         try:
             data = _fetch_week(date)
