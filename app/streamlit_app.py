@@ -25,8 +25,11 @@ from app.scoring import (DEFAULT_WEIGHTS, ROI_SCORE_WEIGHTS, compute_quality_sco
 from app.train import train_and_evaluate
 from app.upcoming import render_upcoming
 from app.validation import run_walk_forward, surfaces_with_odds, usable_date_range
+from app.i18n import install_translations, render_language_selector, translate
 
 st.set_page_config(page_title="Tennis ML Lab", layout="wide")
+install_translations()
+render_language_selector(st)
 
 
 # ----------------------------------------------------------------------
@@ -138,13 +141,13 @@ def render_glossary():
 # Le cache stocke par ailleurs l'objet ET sa version picklée, donc le coût réel
 # est le double de la taille du DataFrame.
 @st.cache_data(max_entries=1,
-               show_spinner="Chargement des matchs et calcul des features (Elo, forme, H2H)...")
+               show_spinner=translate("Chargement des matchs et calcul des features (Elo, forme, H2H)..."))
 def get_dataset():
     matches = load_matches()
     return compute_chronological_features(matches)
 
 
-@st.cache_data(max_entries=4, show_spinner="Construction du jeu d'entraînement...")
+@st.cache_data(max_entries=4, show_spinner=translate("Construction du jeu d'entraînement..."))
 def get_training_frame(odds_label, min_date, max_date):
     df = get_dataset()
     odds_w, odds_l = ODDS_CHOICES[odds_label]

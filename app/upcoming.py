@@ -12,6 +12,7 @@ import streamlit as st
 from curl_cffi import requests
 
 from app import bet_log, odds_log, store
+from app.i18n import translate
 from app.backtest import DEFAULT_STRATEGY
 from app.live_match import (
     FEATURE_LABELS, build_live_features, compute_current_player_state,
@@ -58,7 +59,7 @@ def _fetch_week(date: dt.date) -> dict:
     return resp.json()
 
 
-@st.cache_data(ttl=1800, show_spinner="Récupération du calendrier ATP (ESPN)...")
+@st.cache_data(ttl=1800, show_spinner=translate("Récupération du calendrier ATP (ESPN)..."))
 def get_upcoming_matches(days_ahead: int = 21) -> pd.DataFrame:
     """Interroge le scoreboard ESPN une fois par semaine sur la fenêtre demandée.
 

@@ -6,6 +6,7 @@ The application is intended for research and education. Backtest results are not
 
 ## Features
 
+- French and English interface with an in-app language selector. The selected language is saved locally in `data/ui_preferences.json`.
 - Chronological Elo, surface Elo, recent form, head-to-head, ranking, age, height, experience, and market-odds features.
 - Logistic regression, decision tree, random forest, gradient boosting, and KNN models.
 - Walk-forward validation, calibration metrics, AUC, log loss, Brier score, and accuracy.
@@ -100,7 +101,7 @@ ODDS_API_IO_KEY = "your-odds-api-io-key"
 
 ## Windows launcher
 
-After installation, double-click `lancer_app.bat`. It uses `.venv` automatically when it exists and otherwise falls back to the Python executable available on `PATH`.
+After installation, double-click `launch_app.bat`. It uses `.venv` automatically when it exists and otherwise falls back to the Python executable available on `PATH`.
 
 ## Project layout
 
@@ -109,7 +110,7 @@ app/                    Streamlit UI and ML/backtesting modules
 scripts/update_data.py  Download and consolidation entry point
 scripts/consolidate/    Source loaders, matching, review, and SQLite writer
 requirements.txt        Python dependencies
-lancer_app.bat          Windows launcher
+launch_app.bat          Windows launcher
 data/                   Generated database, caches, models, and source data
 ```
 
